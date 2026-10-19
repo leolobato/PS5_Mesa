@@ -9,9 +9,14 @@
  * the DRM backend (wsi_common_display.c), which the console does not have.
  *
  * The display has one plane and one 3840x2160 mode at 59.94 Hz, and a 119.88
- * Hz mode first where the title's metadata declares high-frame-rate output
- * and the display refreshes at it (measured, as PS5_Vulkan's ps5vk measured
- * both). VideoOut's framebuffers are the process's: sets of five buffers of
+ * Hz mode first where the title asks for it and the display refreshes at it
+ * (measured, as PS5_Vulkan's ps5vk measured both). The title asks through
+ * PS5_VIDEOOUT_REFRESH (60 or 120, or wsi_videoout_set_refresh before the
+ * output opens) or, without it, by declaring high-frame-rate output in its
+ * param.json (/app0's, or the one PS5_VIDEOOUT_PARAM_JSON names); VideoOut
+ * itself grants the mode or refuses it.
+ *
+ * VideoOut's framebuffers are the process's: sets of five buffers of
  * direct memory, one set per swapchain size, each registered once, in the
  * 64 KiB R_X tiles VideoOut scans out (ps5platform/videoout.h). VideoOut
  * scaled a 1920x1080 set to the whole 3840x2160 output (Remote Play capture
@@ -30,7 +35,11 @@
  * it, scaled to fit with its aspect ratio kept and centred, the bars black.
  *
  * A present waits for the frame on a thread and flips it with
- * sceVideoOutSubmitFlip at the next vblank; FIFO is the only present mode. An
+ * sceVideoOutSubmitFlip at the next vblank; FIFO is the only present mode. A
+ * title may ask VideoOut to show each flip for two or three vblanks
+ * (wsi_videoout_set_flip_rate), or name a frame rate (PS5_VIDEOOUT_FRAME_RATE,
+ * wsi_videoout_set_frame_rate) that the output's rate, once known, turns into
+ * vblanks per flip: at 119.88 Hz, 60 fps is two and 40 fps three. An
  * acquire takes a buffer that is neither on screen, nor waiting for its flip
  * to show, nor held by an application, the one flipped longest ago, and waits
  * for a flip or a vblank when none is.
@@ -89,9 +98,14 @@
 /* A period above this after the high-frame-rate mode was taken: the display
  * went on refreshing at 60 Hz, as a tester's did (PS5_Vulkan, R31). */
 #define VIDEOOUT_HIGH_REFRESH_LIMIT_NS UINT64_C(12500000)
+/* A period below this (or none, a vblank wait failing) was not measured: no
+ * display refreshes faster than 119.88 Hz, every 8.342 ms. */
+#define VIDEOOUT_HIGH_REFRESH_FLOOR_NS UINT64_C(7500000)
 #define VIDEOOUT_PERIOD_INTERVALS 6
-/* param.json's attribute3 bits for high-frame-rate output (PS5_Vulkan R31). */
-#define VIDEOOUT_ATTRIBUTE3_HIGH_FRAME_RATE 0x80040u
+/* param.json's attribute3 bit for 120 Hz output. PS5_Vulkan R31/R92 declared it with 0x80000
+ * (a 120 Hz mode that requires VRR), which turns the system's VRR off; retail titles with VRR
+ * declare 0x40 with 0x40000. VideoOut itself grants mode 15 or refuses it. */
+#define VIDEOOUT_ATTRIBUTE3_HIGH_FRAME_RATE 0x40u
 
 #if !defined(__PROSPERO__)
 /* The host model: flips show at once and a vblank comes every millisecond,
@@ -168,23 +182,39 @@ sceVideoOutGetFlipStatus(int32_t handle, uint64_t status[PS5_VIDEO_OUT_FLIP_STAT
    return 0;
 }
 
+/* MESA_VK_VIDEOOUT_HOST_HIGH_VBLANK_US set: the output takes mode 15, and a
+ * vblank then comes every that many microseconds, for a host test of the
+ * 119.88 Hz checks (8342 a display refreshing at it, 16683 one left at 60 Hz,
+ * 1000 one too fast to be a measurement). Unset, mode 15 is not supported. */
+static unsigned host_vblank_us = 1000;
+
+static unsigned
+host_high_vblank_us(void)
+{
+   const char *const value = getenv("MESA_VK_VIDEOOUT_HOST_HIGH_VBLANK_US");
+   return value != NULL ? (unsigned)strtoul(value, NULL, 10) : 0;
+}
+
 static int
 sceVideoOutWaitVblank(int32_t handle)
 {
-   os_time_sleep(1000);
+   os_time_sleep(host_vblank_us);
    return 0;
 }
 
 static int
 sceVideoOutIsOutputSupported(int32_t handle, uint32_t mode, const void *a, const void *b, const void *c)
 {
-   return 0;
+   return host_high_vblank_us() != 0 ? 1 : 0;
 }
 
 static int
 sceVideoOutConfigureOutput(int32_t handle, uint32_t mode, const void *a, const void *b, const void *c)
 {
-   return -1;
+   if (host_high_vblank_us() == 0)
+      return -1;
+   host_vblank_us = mode == PS5_VIDEO_OUT_MODE_HIGH_FRAME_RATE ? host_high_vblank_us() : 1000;
+   return 0;
 }
 #endif
 
@@ -287,6 +317,14 @@ static struct wsi_videoout_output videoout_output = {
    .cpu_set = -1,
 };
 static once_flag videoout_once = ONCE_FLAG_INIT;
+/* sceVideoOutSetFlipRate's rate for the output: a flip shows for at least
+ * rate + 1 vblanks. Set with set 0's registration. Under the output's lock. */
+static int videoout_flip_rate;
+/* What wsi_videoout_set_refresh and wsi_videoout_set_frame_rate asked for
+ * before the output opened, in place of PS5_VIDEOOUT_REFRESH and
+ * PS5_VIDEOOUT_FRAME_RATE; -1 for nothing. Under the output's lock. */
+static int videoout_refresh_asked = -1;
+static int videoout_frame_rate_asked = -1;
 
 static void
 videoout_output_init_once(void)
@@ -321,10 +359,13 @@ struct wsi_videoout {
 
 /* --- VideoOut ------------------------------------------------------------ */
 
+/* The title's param.json: /app0's, or the one PS5_VIDEOOUT_PARAM_JSON names, for a title
+ * without /app0 (an elevated process does not see it). */
 static bool
 videoout_title_declares_high_frame_rate(void)
 {
-   FILE *const file = fopen("/app0/sce_sys/param.json", "rb");
+   const char *const path = getenv("PS5_VIDEOOUT_PARAM_JSON");
+   FILE *const file = fopen(path != NULL && path[0] != '\0' ? path : "/app0/sce_sys/param.json", "rb");
    if (file == NULL)
       return false;
    char text[16384];
@@ -363,9 +404,52 @@ videoout_vblank_period_ns(int handle)
    return intervals[VIDEOOUT_PERIOD_INTERVALS / 2];
 }
 
+/* A frame rate the output can be paced to: 0 (no cap), 120, 60, 40 or 30. */
+static bool
+videoout_frame_rate_valid(int fps)
+{
+   return fps == 0 || fps == 120 || fps == 60 || fps == 40 || fps == 30;
+}
+
+/* A switch from the environment as a number: -1 unset or empty, -2 not a
+ * number. */
+static int
+videoout_env_number(const char *name)
+{
+   const char *const value = getenv(name);
+   if (value == NULL || value[0] == '\0')
+      return -1;
+   char *end;
+   const long number = strtol(value, &end, 10);
+   return *end == '\0' && number >= 0 && number <= 1000 ? (int)number : -2;
+}
+
+/* The flip rate that paces fps frames a second at the output's rate: each
+ * flip shows for output / fps vblanks where that is one, two or three
+ * (119.88 Hz: 120, 60 and 40 fps; 59.94 Hz: 60 and 30 fps). Any other frame
+ * rate is not capped, so a display that refused 119.88 Hz never turns 60 fps
+ * into 30 or 40 into 20. 0 fps is no cap. Under the output's lock. */
+static int
+videoout_frame_rate_flip_rate_locked(unsigned fps)
+{
+   const unsigned hz = videoout_output.high_frame_rate ? 120 : 60;
+   const char *const rate = videoout_output.high_frame_rate ? "119.88" : "59.94";
+   if (fps == 0)
+      return 0;
+   if (hz % fps == 0 && hz / fps <= 3) {
+      const int vblanks = (int)(hz / fps);
+      fprintf(stderr, "wsi/videoout: %u fps paced as each flip for %d vblanks at %s Hz\n", fps, vblanks, rate);
+      return vblanks - 1;
+   }
+   fprintf(stderr, "wsi/videoout: %u fps cannot be paced at %s Hz; not capped\n", fps, rate);
+   return 0;
+}
+
 /* Opens VideoOut once per process, in the high-frame-rate mode where the
- * title declares it, the output takes it and the display then refreshes at
- * it. Under lock. */
+ * title asks for it, the output takes it and the display then refreshes at
+ * it, and paces it to the title's frame rate. The title asks with
+ * PS5_VIDEOOUT_REFRESH (or wsi_videoout_set_refresh): 60 never, 120 without
+ * reading param.json, unset where param.json declares it. Under lock. */
 static bool
 videoout_open_locked(void)
 {
@@ -378,29 +462,133 @@ videoout_open_locked(void)
       fprintf(stderr, "wsi/videoout: sceVideoOutOpen failed: 0x%08x\n", (unsigned)out->handle);
       return false;
    }
-   if (videoout_title_declares_high_frame_rate()) {
+   int refresh = videoout_refresh_asked;
+   if (refresh < 0) {
+      refresh = videoout_env_number("PS5_VIDEOOUT_REFRESH");
+      if (refresh == -2 || (refresh >= 0 && refresh != 60 && refresh != 120)) {
+         fprintf(stderr, "wsi/videoout: PS5_VIDEOOUT_REFRESH=%s ignored (60 or 120)\n",
+                 getenv("PS5_VIDEOOUT_REFRESH"));
+         refresh = -1;
+      }
+   }
+   if (refresh == 60) {
+      fprintf(stderr, "wsi/videoout: 119.88 Hz not asked for (PS5_VIDEOOUT_REFRESH=60)\n");
+   } else if (refresh == 120 || videoout_title_declares_high_frame_rate()) {
       const int supported =
          sceVideoOutIsOutputSupported(out->handle, PS5_VIDEO_OUT_MODE_HIGH_FRAME_RATE, NULL, NULL, NULL);
       const int configured =
          supported > 0
             ? sceVideoOutConfigureOutput(out->handle, PS5_VIDEO_OUT_MODE_HIGH_FRAME_RATE, NULL, NULL, NULL)
             : supported;
-      out->high_frame_rate = configured == 0;
+      /* Not supported (0) configures nothing: it is not an acceptance. */
+      out->high_frame_rate = supported > 0 && configured == 0;
       if (out->high_frame_rate) {
+         /* A period of 0 (a vblank wait failed) or one no display has is no
+          * measurement: the mode is not kept unmeasured. */
          const uint64_t period = videoout_vblank_period_ns(out->handle);
-         if (period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS) {
+         if (period < VIDEOOUT_HIGH_REFRESH_FLOOR_NS || period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS) {
             sceVideoOutConfigureOutput(out->handle, PS5_VIDEO_OUT_MODE_RESTORE, NULL, NULL, NULL);
             out->high_frame_rate = false;
-            fprintf(stderr,
-                    "wsi/videoout: 119.88 Hz accepted, but a vblank comes every %.3f ms; 59.94 Hz restored\n",
-                    (double)period / 1e6);
+            if (period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS)
+               fprintf(stderr,
+                       "wsi/videoout: 119.88 Hz accepted, but a vblank comes every %.3f ms; 59.94 Hz restored\n",
+                       (double)period / 1e6);
+            else
+               fprintf(stderr, "wsi/videoout: 119.88 Hz accepted, but the vblank period could not be measured; "
+                               "59.94 Hz restored\n");
+         } else {
+            fprintf(stderr, "wsi/videoout: 119.88 Hz output, a vblank every %.3f ms\n", (double)period / 1e6);
          }
       } else {
          fprintf(stderr, "wsi/videoout: 119.88 Hz %s (%d); presenting at 59.94 Hz\n",
                  supported > 0 ? "refused" : "not supported", configured);
       }
    }
+
+   /* The frame rate, now that the output's rate is known: set 0's
+    * registration sets its flip rate. */
+   int frame_rate = videoout_frame_rate_asked;
+   if (frame_rate < 0) {
+      frame_rate = videoout_env_number("PS5_VIDEOOUT_FRAME_RATE");
+      if (frame_rate == -2 || (frame_rate >= 0 && !videoout_frame_rate_valid(frame_rate))) {
+         fprintf(stderr, "wsi/videoout: PS5_VIDEOOUT_FRAME_RATE=%s ignored (0, 120, 60, 40 or 30)\n",
+                 getenv("PS5_VIDEOOUT_FRAME_RATE"));
+         frame_rate = -1;
+      }
+   }
+   if (frame_rate >= 0)
+      videoout_flip_rate = videoout_frame_rate_flip_rate_locked((unsigned)frame_rate);
    return true;
+}
+
+PUBLIC int wsi_videoout_set_refresh(int hz);
+PUBLIC int wsi_videoout_set_flip_rate(int rate);
+PUBLIC int wsi_videoout_set_frame_rate(int fps);
+
+/* The title's switch in place of PS5_VIDEOOUT_REFRESH, for a title whose
+ * environment the driver does not see: 60 never offers 119.88 Hz, 120 offers
+ * it where VideoOut grants it without reading param.json, 0 follows
+ * param.json. Only before the output opens, as listing the display's modes
+ * opens it. Returns 0, -1 for a rate it does not take, -2 once the output is
+ * open. */
+PUBLIC int
+wsi_videoout_set_refresh(int hz)
+{
+   if (hz != 0 && hz != 60 && hz != 120)
+      return -1;
+   call_once(&videoout_once, videoout_output_init_once);
+   mtx_lock(&videoout_output.lock);
+   const bool opened = videoout_output.opened;
+   if (!opened)
+      videoout_refresh_asked = hz;
+   mtx_unlock(&videoout_output.lock);
+   return opened ? -2 : 0;
+}
+
+/* Frame pacing for the title: each flip shows for at least rate + 1 vblanks
+ * (0 every vblank, 1 every second, 2 every third), on the open output at once
+ * and on one opened later. A frame rate asked for (PS5_VIDEOOUT_FRAME_RATE,
+ * wsi_videoout_set_frame_rate) replaces it when the output opens; after
+ * that, the later call wins. Returns VideoOut's answer, 0 before the output's
+ * framebuffers are registered, -1 for a rate it does not take. */
+PUBLIC int
+wsi_videoout_set_flip_rate(int rate)
+{
+   if (rate < 0 || rate > 2)
+      return -1;
+   call_once(&videoout_once, videoout_output_init_once);
+   mtx_lock(&videoout_output.lock);
+   videoout_flip_rate = rate;
+   const int result = videoout_output.handle >= 0 && videoout_output.set_count > 0
+                         ? sceVideoOutSetFlipRate(videoout_output.handle, rate)
+                         : 0;
+   mtx_unlock(&videoout_output.lock);
+   return result;
+}
+
+/* Frame pacing by a frame rate in place of PS5_VIDEOOUT_FRAME_RATE, for a
+ * title whose environment the driver does not see: 0 (no cap), 120, 60, 40
+ * or 30, turned into a flip rate by the output's rate
+ * (videoout_frame_rate_flip_rate_locked) when the output opens, or at once on
+ * an open one. Returns VideoOut's answer, 0 before the output's framebuffers
+ * are registered, -1 for a frame rate it does not take. */
+PUBLIC int
+wsi_videoout_set_frame_rate(int fps)
+{
+   if (!videoout_frame_rate_valid(fps))
+      return -1;
+   call_once(&videoout_once, videoout_output_init_once);
+   mtx_lock(&videoout_output.lock);
+   int result = 0;
+   if (videoout_output.handle >= 0) {
+      videoout_flip_rate = videoout_frame_rate_flip_rate_locked((unsigned)fps);
+      if (videoout_output.set_count > 0)
+         result = sceVideoOutSetFlipRate(videoout_output.handle, videoout_flip_rate);
+   } else {
+      videoout_frame_rate_asked = fps;
+   }
+   mtx_unlock(&videoout_output.lock);
+   return result;
 }
 
 static void
@@ -478,7 +666,7 @@ videoout_register_kind_locked(VkExtent2D extent, bool cpu, uint32_t *set_out)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 #endif
 
-   int result = set == 0 ? sceVideoOutSetFlipRate(out->handle, 0) : 0;
+   int result = set == 0 ? sceVideoOutSetFlipRate(out->handle, videoout_flip_rate) : 0;
    struct ps5_video_out_buffer registered[VIDEOOUT_BUFFERS];
    for (uint32_t i = 0; i < VIDEOOUT_BUFFERS; i++)
       registered[i] = (struct ps5_video_out_buffer){.data = buffers + i * buffer_bytes};
