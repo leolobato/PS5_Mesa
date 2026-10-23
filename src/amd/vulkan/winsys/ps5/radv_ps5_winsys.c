@@ -88,10 +88,13 @@ radv_ps5_queue_poll(struct radv_ps5_queue *queue)
  * end well inside a millisecond (PS5_Vulkan R36). */
 #define RADV_PS5_SPIN_NS UINT64_C(1500000)
 
-/* How many submissions still in flight a stall report describes, and how many
- * of the stuck one's waits it lists. */
+/* How many submissions still in flight a stall report describes, how many of
+ * the stuck one's waits it lists, how many it reads, and how many words of the
+ * work that did not finish it prints. */
 #define RADV_PS5_STALL_SUBMISSIONS 4
 #define RADV_PS5_STALL_WAITS 8
+#define RADV_PS5_STALL_MAX_WAITS 512
+#define RADV_PS5_STALL_DUMP_WORDS 1024
 
 static const char *
 radv_ps5_wait_function(uint32_t function)
@@ -100,84 +103,140 @@ radv_ps5_wait_function(uint32_t function)
    return names[function & 7];
 }
 
-/* What the GPU was given in one submission: its packets by kind, and each
- * WAIT_REG_MEM, since a wait on memory nothing writes stalls the GPU just as a
- * fault or a shader that does not end does. */
+/* The words of the packet whose header is at words[at], or 0 if there is no
+ * packet header there or the packet runs past count. */
+static uint32_t
+radv_ps5_packet_length(const uint32_t *words, uint32_t at, uint32_t count)
+{
+   const uint32_t header = words[at];
+   const unsigned type = PKT_TYPE_G(header);
+   if (type == 2)
+      return 1;
+   if (type == 1)
+      return 0;
+   /* PKT3_NOP_PAD: a NOP of the header alone. */
+   const uint32_t length =
+      type == 3 && PKT3_IT_OPCODE_G(header) == PKT3_NOP && PKT_COUNT_G(header) == 0x3fff ? 1 : PKT_COUNT_G(header) + 2;
+   return length <= count - at ? length : 0;
+}
+
+static bool
+radv_ps5_packet_is_draw(unsigned opcode)
+{
+   switch (opcode) {
+   case PKT3_DRAW_INDIRECT:
+   case PKT3_DRAW_INDEX_INDIRECT:
+   case PKT3_DRAW_INDEX_2:
+   case PKT3_DRAW_INDIRECT_MULTI:
+   case PKT3_DRAW_INDEX_AUTO:
+   case PKT3_DRAW_INDEX_MULTI_AUTO:
+   case PKT3_DRAW_INDEX_OFFSET_2:
+   case PKT3_DRAW_INDEX_INDIRECT_MULTI:
+   case PKT3_DISPATCH_MESH_INDIRECT_MULTI:
+   case PKT3_DISPATCH_TASKMESH_GFX:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+radv_ps5_packet_is_dispatch(unsigned opcode)
+{
+   return opcode == PKT3_DISPATCH_DIRECT || opcode == PKT3_DISPATCH_INDIRECT;
+}
+
+/* The shader program registers RADV sets on GFX10.3 (radv_shader.c): pixel,
+ * legacy vertex, NGG or geometry (ES), hull (LS) and compute. Each holds the
+ * program address >> 8, with bits 40 and up in the next register. */
+static const struct {
+   uint32_t reg;
+   const char *stage;
+} radv_ps5_program_regs[] = {
+   {R_00B020_SPI_SHADER_PGM_LO_PS, "PS"}, {R_00B120_SPI_SHADER_PGM_LO_VS, "VS"},
+   {R_00B320_SPI_SHADER_PGM_LO_ES, "GS"}, {R_00B520_SPI_SHADER_PGM_LO_LS, "HS"},
+   {R_00B830_COMPUTE_PGM_LO, "CS"},
+};
+
+struct radv_ps5_stall_wait {
+   uint32_t at;
+   uint32_t control;
+   uint64_t address;
+   uint32_t reference;
+   uint32_t mask;
+};
+
+/* What the GPU was given in one submission: its packets by kind and each
+ * WAIT_REG_MEM, then where in it the GPU stopped. RADV ends work it has to wait
+ * for with a barrier (radv_cs_emit_cache_flush): a RELEASE_MEM writes the next
+ * value of the command buffer's counter once the work before it has finished,
+ * and the CP waits until the counter equals it. The counter lives in the
+ * command buffer's upload buffer, which the CPU sees at the GPU's address while
+ * the submission is pending. Its value tells which barrier the GPU passed last:
+ * the work after that one is what did not finish, and the report prints it. */
 static void
 radv_ps5_report_packets(uint64_t seq, const uint32_t *words, uint32_t count)
 {
-   unsigned packets = 0, draws = 0, dispatches = 0, waits = 0, dma = 0, syncs = 0;
+   static struct radv_ps5_stall_wait waits_seen[RADV_PS5_STALL_MAX_WAITS];
+   unsigned packets = 0, draws = 0, dispatches = 0, waits = 0, dma = 0, syncs = 0, kept = 0;
    uint32_t at = 0;
    while (at < count) {
-      const uint32_t header = words[at];
-      const unsigned type = PKT_TYPE_G(header);
-      if (type == 2) {
-         at++;
+      const uint32_t length = radv_ps5_packet_length(words, at, count);
+      if (!length) {
+         fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " word %u is not a whole packet (0x%08x)\n", seq,
+                 at, words[at]);
+         count = at;
+         break;
+      }
+      if (PKT_TYPE_G(words[at]) != 3) {
+         at += length;
          continue;
       }
-      if (type == 1) {
-         fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " word %u is not a packet header (0x%08x)\n", seq,
-                 at, header);
-         break;
-      }
-      const unsigned opcode = PKT3_IT_OPCODE_G(header);
-      /* PKT3_NOP_PAD: a NOP of the header alone. */
-      const uint32_t length =
-         type == 3 && opcode == PKT3_NOP && PKT_COUNT_G(header) == 0x3fff ? 1 : PKT_COUNT_G(header) + 2;
-      if (length > count - at) {
-         fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " packet at word %u (0x%08x) runs past its end\n",
-                 seq, at, header);
-         break;
-      }
       packets++;
-      if (type == 3) {
-         switch (opcode) {
-         case PKT3_DRAW_INDIRECT:
-         case PKT3_DRAW_INDEX_INDIRECT:
-         case PKT3_DRAW_INDEX_2:
-         case PKT3_DRAW_INDIRECT_MULTI:
-         case PKT3_DRAW_INDEX_AUTO:
-         case PKT3_DRAW_INDEX_MULTI_AUTO:
-         case PKT3_DRAW_INDEX_OFFSET_2:
-         case PKT3_DRAW_INDEX_INDIRECT_MULTI:
-         case PKT3_DISPATCH_MESH_INDIRECT_MULTI:
-         case PKT3_DISPATCH_TASKMESH_GFX:
-            draws++;
+      const unsigned opcode = PKT3_IT_OPCODE_G(words[at]);
+      if (radv_ps5_packet_is_draw(opcode))
+         draws++;
+      else if (radv_ps5_packet_is_dispatch(opcode))
+         dispatches++;
+      switch (opcode) {
+      case PKT3_DMA_DATA:
+         dma++;
+         break;
+      case PKT3_EVENT_WRITE:
+      case PKT3_RELEASE_MEM:
+      case PKT3_ACQUIRE_MEM:
+      case PKT3_PFP_SYNC_ME:
+         syncs++;
+         break;
+      case PKT3_WAIT_REG_MEM:
+         if (length < 7)
             break;
-         case PKT3_DISPATCH_DIRECT:
-         case PKT3_DISPATCH_INDIRECT:
-            dispatches++;
-            break;
-         case PKT3_DMA_DATA:
-            dma++;
-            break;
-         case PKT3_EVENT_WRITE:
-         case PKT3_RELEASE_MEM:
-         case PKT3_ACQUIRE_MEM:
-         case PKT3_PFP_SYNC_ME:
-            syncs++;
-            break;
-         case PKT3_WAIT_REG_MEM:
-            if (waits++ < RADV_PS5_STALL_WAITS && length >= 7) {
-               const uint32_t control = words[at + 1];
-               const uint64_t address = words[at + 2] | ((uint64_t)words[at + 3] << 32);
-               if (control & 0x10)
-                  fprintf(stderr,
-                          "radv/ps5: GPU stall: submission %" PRIu64 " word %u waits until memory 0x%" PRIx64
-                          " & 0x%08x %s 0x%08x (%s)\n",
-                          seq, at, address, words[at + 5], radv_ps5_wait_function(control), words[at + 4],
-                          (control >> 8) & 3 ? "PFP" : "ME");
-               else
-                  fprintf(stderr,
-                          "radv/ps5: GPU stall: submission %" PRIu64 " word %u waits until register 0x%x & 0x%08x %s "
-                          "0x%08x (%s)\n",
-                          seq, at, words[at + 2], words[at + 5], radv_ps5_wait_function(control), words[at + 4],
-                          (control >> 8) & 3 ? "PFP" : "ME");
-            }
-            break;
-         default:
-            break;
+         if (kept < RADV_PS5_STALL_MAX_WAITS)
+            waits_seen[kept++] = (struct radv_ps5_stall_wait){
+               .at = at,
+               .control = words[at + 1],
+               .address = words[at + 2] | ((uint64_t)words[at + 3] << 32),
+               .reference = words[at + 4],
+               .mask = words[at + 5],
+            };
+         if (waits++ < RADV_PS5_STALL_WAITS) {
+            const uint32_t control = words[at + 1];
+            if (control & 0x10)
+               fprintf(stderr,
+                       "radv/ps5: GPU stall: submission %" PRIu64 " word %u waits until memory 0x%" PRIx64
+                       " & 0x%08x %s 0x%08x (%s)\n",
+                       seq, at, (uint64_t)words[at + 2] | ((uint64_t)words[at + 3] << 32), words[at + 5],
+                       radv_ps5_wait_function(control), words[at + 4], (control >> 8) & 3 ? "PFP" : "ME");
+            else
+               fprintf(stderr,
+                       "radv/ps5: GPU stall: submission %" PRIu64 " word %u waits until register 0x%x & 0x%08x %s "
+                       "0x%08x (%s)\n",
+                       seq, at, words[at + 2], words[at + 5], radv_ps5_wait_function(control), words[at + 4],
+                       (control >> 8) & 3 ? "PFP" : "ME");
          }
+         break;
+      default:
+         break;
       }
       at += length;
    }
@@ -185,6 +244,85 @@ radv_ps5_report_packets(uint64_t seq, const uint32_t *words, uint32_t count)
            "radv/ps5: GPU stall: submission %" PRIu64 " has %u packets: %u draws, %u dispatches, %u waits, %u DMA, "
            "%u syncs\n",
            seq, packets, draws, dispatches, waits, dma, syncs);
+
+   /* The first barrier not yet reached. Only an equality wait on memory in the
+    * window is a barrier; its counter is read once per address. */
+   uint32_t from = 0, to = count;
+   uint64_t read_address = 0;
+   uint32_t value = 0;
+   for (unsigned i = 0; i < kept; i++) {
+      const struct radv_ps5_stall_wait *const wait = &waits_seen[i];
+      if (!(wait->control & 0x10) || (wait->control & 7) != 3 || wait->mask != 0xffffffff ||
+          wait->address < RADV_PS5_WINDOW_BASE || wait->address + 4 > RADV_PS5_WINDOW_BASE + RADV_PS5_WINDOW_BYTES)
+         continue;
+      if (wait->address != read_address) {
+         volatile const uint32_t *const counter = (volatile const uint32_t *)(uintptr_t)wait->address;
+         radv_ps5_cpu_flush((const void *)counter, sizeof(*counter));
+         value = *counter;
+         read_address = wait->address;
+      }
+      if (wait->reference <= value) {
+         from = wait->at + 7;
+         continue;
+      }
+      to = wait->at;
+      fprintf(stderr,
+              "radv/ps5: GPU stall: submission %" PRIu64 " stopped before the barrier at word %u: the counter at 0x%" PRIx64
+              " holds 0x%08x, the barrier waits for 0x%08x\n",
+              seq, wait->at, wait->address, value, wait->reference);
+      break;
+   }
+   if (to == count)
+      fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " passed every barrier; it stopped after word %u\n", seq,
+              from);
+
+   /* The shaders bound when that work started, and what the work is. */
+   uint32_t program_lo[ARRAY_SIZE(radv_ps5_program_regs)] = {0};
+   uint32_t program_hi[ARRAY_SIZE(radv_ps5_program_regs)] = {0};
+   unsigned work_draws = 0, work_dispatches = 0, work_dma = 0;
+   for (at = 0; at < to;) {
+      const uint32_t length = radv_ps5_packet_length(words, at, count);
+      if (!length)
+         break;
+      const unsigned opcode = PKT3_IT_OPCODE_G(words[at]);
+      if (PKT_TYPE_G(words[at]) == 3 && opcode == PKT3_SET_SH_REG && length >= 3) {
+         const uint32_t first = SI_SH_REG_OFFSET + words[at + 1] * 4;
+         for (uint32_t v = 0; v < length - 2; v++) {
+            const uint32_t reg = first + v * 4;
+            for (unsigned r = 0; r < ARRAY_SIZE(radv_ps5_program_regs); r++) {
+               if (reg == radv_ps5_program_regs[r].reg)
+                  program_lo[r] = words[at + 2 + v];
+               else if (reg == radv_ps5_program_regs[r].reg + 4)
+                  program_hi[r] = words[at + 2 + v];
+            }
+         }
+      }
+      if (at >= from && PKT_TYPE_G(words[at]) == 3) {
+         work_draws += radv_ps5_packet_is_draw(opcode);
+         work_dispatches += radv_ps5_packet_is_dispatch(opcode);
+         work_dma += opcode == PKT3_DMA_DATA;
+      }
+      at += length;
+   }
+   fprintf(stderr,
+           "radv/ps5: GPU stall: submission %" PRIu64 " words %u-%u did not finish: %u draws, %u dispatches, %u DMA\n",
+           seq, from, to, work_draws, work_dispatches, work_dma);
+   for (unsigned r = 0; r < ARRAY_SIZE(radv_ps5_program_regs); r++) {
+      if (program_lo[r])
+         fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " %s program 0x%" PRIx64 " bound by word %u\n", seq,
+                 radv_ps5_program_regs[r].stage, ((uint64_t)program_hi[r] << 40) | ((uint64_t)program_lo[r] << 8), to);
+   }
+
+   /* The words themselves, for decoding (ac_parse_ib); the last ones before the
+    * barrier if there are more. */
+   const uint32_t first = to - from > RADV_PS5_STALL_DUMP_WORDS ? to - RADV_PS5_STALL_DUMP_WORDS : from;
+   for (uint32_t line = first; line < to; line += 8) {
+      char text[8 * 9 + 1];
+      unsigned used = 0;
+      for (uint32_t w = line; w < to && w < line + 8; w++)
+         used += snprintf(text + used, sizeof(text) - used, " %08x", words[w]);
+      fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " @%u:%s\n", seq, line, text);
+   }
 }
 
 void
