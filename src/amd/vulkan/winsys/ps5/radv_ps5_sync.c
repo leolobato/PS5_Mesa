@@ -150,7 +150,7 @@ radv_ps5_sync_wait_many(struct vk_device *device, uint32_t wait_count, const str
          mtx_unlock(&queue->sync_lock);
          if (any) {
             radv_ps5_sleep_us(100);
-         } else if (!radv_ps5_queue_wait_seq(queue, need, abs_timeout_ns)) {
+         } else if (!radv_ps5_queue_wait_seq(queue, need, abs_timeout_ns, "sync wait")) {
             return os_time_get_nano() >= abs_timeout_ns ? VK_TIMEOUT : VK_ERROR_DEVICE_LOST;
          }
          mtx_lock(&queue->sync_lock);

@@ -35,6 +35,11 @@ struct radv_ps5_in_flight {
    uint32_t start;
    uint32_t end;
    struct radv_ps5_memory dedicated;
+   /* For a stall report: the words, the AGC submissions they went in, and
+    * when (os_time_get_nano). */
+   uint32_t words;
+   uint32_t parts;
+   uint64_t submitted_ns;
 };
 
 /* The GPU queue, shared by every winsys in the process: each VkDevice gets a
@@ -62,6 +67,16 @@ struct radv_ps5_queue {
    uint64_t tess_factor_ring_va;
    uint32_t tess_factor_ring_size;
    bool hs_offchip_param_set;
+   /* The submission the current ring was handed over before, for a stall report. */
+   uint64_t tess_factor_ring_seq;
+
+   /* Set by the first stall report: later stalls get one line. */
+   uint32_t stall_reported;
+   /* The submission being handed to AGC and since when (os_time_get_nano), 0
+    * once the call returned: a stall report tells a submit call that does not
+    * return from a GPU that does not finish. */
+   uint64_t agc_submit_seq;
+   uint64_t agc_submit_ns;
 
    /* Waiters for a sync object to be submitted for signalling. */
    mtx_t sync_lock;
@@ -163,8 +178,14 @@ struct radv_ps5_ctx {
 /* Completion: the sequence the GPU has run up to, read from the marker. */
 uint64_t radv_ps5_queue_poll(struct radv_ps5_queue *queue);
 /* Waits until the GPU has run seq, or until abs_timeout_ns (os_time_get_nano's
- * clock); false on timeout. */
-bool radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs_timeout_ns);
+ * clock); false on timeout, or when the GPU stops making progress, which is
+ * reported once with what it was running. waiter names the caller in that
+ * report. */
+bool radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs_timeout_ns, const char *waiter);
+/* The stall report: the submissions still in flight, and the packets of the
+ * one the GPU has not finished. It takes no lock, since the thread holding the
+ * submit lock may be the one that does not return. */
+void radv_ps5_queue_report_stall(struct radv_ps5_queue *queue, uint64_t seq, const char *waiter, uint64_t stalled_ns);
 
 /* The sync object type: binary, signalled by a submission's sequence number or
  * by the host. The physical device builds timelines over it

@@ -88,8 +88,164 @@ radv_ps5_queue_poll(struct radv_ps5_queue *queue)
  * end well inside a millisecond (PS5_Vulkan R36). */
 #define RADV_PS5_SPIN_NS UINT64_C(1500000)
 
+/* How many submissions still in flight a stall report describes, and how many
+ * of the stuck one's waits it lists. */
+#define RADV_PS5_STALL_SUBMISSIONS 4
+#define RADV_PS5_STALL_WAITS 8
+
+static const char *
+radv_ps5_wait_function(uint32_t function)
+{
+   static const char *const names[8] = {"always", "<", "<=", "==", "!=", ">=", ">", "(reserved)"};
+   return names[function & 7];
+}
+
+/* What the GPU was given in one submission: its packets by kind, and each
+ * WAIT_REG_MEM, since a wait on memory nothing writes stalls the GPU just as a
+ * fault or a shader that does not end does. */
+static void
+radv_ps5_report_packets(uint64_t seq, const uint32_t *words, uint32_t count)
+{
+   unsigned packets = 0, draws = 0, dispatches = 0, waits = 0, dma = 0, syncs = 0;
+   uint32_t at = 0;
+   while (at < count) {
+      const uint32_t header = words[at];
+      const unsigned type = PKT_TYPE_G(header);
+      if (type == 2) {
+         at++;
+         continue;
+      }
+      if (type == 1) {
+         fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " word %u is not a packet header (0x%08x)\n", seq,
+                 at, header);
+         break;
+      }
+      const unsigned opcode = PKT3_IT_OPCODE_G(header);
+      /* PKT3_NOP_PAD: a NOP of the header alone. */
+      const uint32_t length =
+         type == 3 && opcode == PKT3_NOP && PKT_COUNT_G(header) == 0x3fff ? 1 : PKT_COUNT_G(header) + 2;
+      if (length > count - at) {
+         fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " packet at word %u (0x%08x) runs past its end\n",
+                 seq, at, header);
+         break;
+      }
+      packets++;
+      if (type == 3) {
+         switch (opcode) {
+         case PKT3_DRAW_INDIRECT:
+         case PKT3_DRAW_INDEX_INDIRECT:
+         case PKT3_DRAW_INDEX_2:
+         case PKT3_DRAW_INDIRECT_MULTI:
+         case PKT3_DRAW_INDEX_AUTO:
+         case PKT3_DRAW_INDEX_MULTI_AUTO:
+         case PKT3_DRAW_INDEX_OFFSET_2:
+         case PKT3_DRAW_INDEX_INDIRECT_MULTI:
+         case PKT3_DISPATCH_MESH_INDIRECT_MULTI:
+         case PKT3_DISPATCH_TASKMESH_GFX:
+            draws++;
+            break;
+         case PKT3_DISPATCH_DIRECT:
+         case PKT3_DISPATCH_INDIRECT:
+            dispatches++;
+            break;
+         case PKT3_DMA_DATA:
+            dma++;
+            break;
+         case PKT3_EVENT_WRITE:
+         case PKT3_RELEASE_MEM:
+         case PKT3_ACQUIRE_MEM:
+         case PKT3_PFP_SYNC_ME:
+            syncs++;
+            break;
+         case PKT3_WAIT_REG_MEM:
+            if (waits++ < RADV_PS5_STALL_WAITS && length >= 7) {
+               const uint32_t control = words[at + 1];
+               const uint64_t address = words[at + 2] | ((uint64_t)words[at + 3] << 32);
+               if (control & 0x10)
+                  fprintf(stderr,
+                          "radv/ps5: GPU stall: submission %" PRIu64 " word %u waits until memory 0x%" PRIx64
+                          " & 0x%08x %s 0x%08x (%s)\n",
+                          seq, at, address, words[at + 5], radv_ps5_wait_function(control), words[at + 4],
+                          (control >> 8) & 3 ? "PFP" : "ME");
+               else
+                  fprintf(stderr,
+                          "radv/ps5: GPU stall: submission %" PRIu64 " word %u waits until register 0x%x & 0x%08x %s "
+                          "0x%08x (%s)\n",
+                          seq, at, words[at + 2], words[at + 5], radv_ps5_wait_function(control), words[at + 4],
+                          (control >> 8) & 3 ? "PFP" : "ME");
+            }
+            break;
+         default:
+            break;
+         }
+      }
+      at += length;
+   }
+   fprintf(stderr,
+           "radv/ps5: GPU stall: submission %" PRIu64 " has %u packets: %u draws, %u dispatches, %u waits, %u DMA, "
+           "%u syncs\n",
+           seq, packets, draws, dispatches, waits, dma, syncs);
+}
+
+void
+radv_ps5_queue_report_stall(struct radv_ps5_queue *queue, uint64_t seq, const char *waiter, uint64_t stalled_ns)
+{
+   const uint64_t completed = radv_ps5_queue_poll(queue);
+   if (p_atomic_xchg(&queue->stall_reported, 1)) {
+      fprintf(stderr, "radv/ps5: the GPU has not reached submission %" PRIu64 " (at %" PRIu64 ") in %u s (%s)\n", seq,
+              completed, (unsigned)(stalled_ns / 1000000000), waiter);
+      return;
+   }
+   /* Read without the submit lock. A record the GPU has not finished is neither
+    * retired nor reused, so its fields and words stay as they were; first and
+    * count are read once, as another thread may still submit or retire. */
+   const uint64_t now = os_time_get_nano();
+   const uint32_t first = p_atomic_read(&queue->in_flight_first);
+   const uint32_t count = MIN2(p_atomic_read(&queue->in_flight_count), RADV_PS5_MAX_IN_FLIGHT);
+   fprintf(stderr,
+           "radv/ps5: GPU stall: %s waited for submission %" PRIu64 "; the GPU has run up to %" PRIu64 " of %" PRIu64
+           ", %u in flight, no progress for %" PRIu64 " ms\n",
+           waiter, seq, completed, p_atomic_read(&queue->submitted_seq), count, stalled_ns / 1000000);
+   const uint64_t agc_seq = p_atomic_read(&queue->agc_submit_seq);
+   const uint64_t agc_ns = p_atomic_read(&queue->agc_submit_ns);
+   if (agc_seq)
+      fprintf(stderr, "radv/ps5: GPU stall: AGC has not returned from submitting %" PRIu64 " for %" PRIu64 " ms\n",
+              agc_seq, (now - agc_ns) / 1000000);
+   if (queue->tess_factor_ring_va)
+      fprintf(stderr, "radv/ps5: GPU stall: tessellation factor ring 0x%" PRIx64 " (%u bytes) since submission %" PRIu64
+              "\n", queue->tess_factor_ring_va, queue->tess_factor_ring_size, queue->tess_factor_ring_seq);
+   unsigned shown = 0, pending = 0;
+   for (uint32_t i = 0; i < count; i++) {
+      const struct radv_ps5_in_flight *const record = &queue->in_flight[(first + i) % RADV_PS5_MAX_IN_FLIGHT];
+      if (record->seq <= completed)
+         continue;
+      pending++;
+      if (shown == RADV_PS5_STALL_SUBMISSIONS)
+         continue;
+      const uint32_t *const words =
+         record->dedicated.cpu ? (const uint32_t *)record->dedicated.cpu : (const uint32_t *)queue->ring.cpu + record->start;
+      if (record->dedicated.cpu)
+         fprintf(stderr,
+                 "radv/ps5: GPU stall: submission %" PRIu64 ": %u words in %u AGC submissions, in a buffer of its own, "
+                 "submitted %" PRIu64 " ms ago\n",
+                 record->seq, record->words, record->parts, (now - record->submitted_ns) / 1000000);
+      else
+         fprintf(stderr,
+                 "radv/ps5: GPU stall: submission %" PRIu64 ": %u words in %u AGC submissions, ring words %u-%u, "
+                 "submitted %" PRIu64 " ms ago\n",
+                 record->seq, record->words, record->parts, record->start, record->end,
+                 (now - record->submitted_ns) / 1000000);
+      /* The oldest one is where the GPU is. */
+      if (shown == 0 && record->words)
+         radv_ps5_report_packets(record->seq, words, record->words);
+      shown++;
+   }
+   if (pending > shown)
+      fprintf(stderr, "radv/ps5: GPU stall: %u more submissions wait behind them\n", pending - shown);
+}
+
 bool
-radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs_timeout_ns)
+radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs_timeout_ns, const char *waiter)
 {
    uint64_t completed = radv_ps5_queue_poll(queue);
    if (completed >= seq)
@@ -109,8 +265,7 @@ radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs
          last = completed;
          progress_at = now;
       } else if (now - progress_at > RADV_PS5_STALL_NS) {
-         fprintf(stderr, "radv/ps5: the GPU has not reached submission %" PRIu64 " (at %" PRIu64 ") in %u s\n", seq,
-                 completed, (unsigned)(RADV_PS5_STALL_NS / 1000000000));
+         radv_ps5_queue_report_stall(queue, seq, waiter, now - progress_at);
          return false;
       }
       if (now < spin_until)
@@ -502,7 +657,7 @@ radv_ps5_ctx_wait_idle(struct radeon_winsys_ctx *rctx, enum amd_ip_type ip_type,
    (void)ip_type;
    (void)ring_index;
    struct radv_ps5_queue *const queue = ((struct radv_ps5_ctx *)rctx)->ws->queue;
-   return radv_ps5_queue_wait_seq(queue, p_atomic_read(&queue->submitted_seq), OS_TIMEOUT_INFINITE);
+   return radv_ps5_queue_wait_seq(queue, p_atomic_read(&queue->submitted_seq), OS_TIMEOUT_INFINITE, "ctx_wait_idle");
 }
 
 static int

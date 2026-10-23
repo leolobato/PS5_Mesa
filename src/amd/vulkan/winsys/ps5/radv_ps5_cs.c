@@ -406,13 +406,13 @@ radv_ps5_queue_claim(struct radv_ps5_queue *queue, uint32_t count, uint64_t seq)
    radv_ps5_queue_retire(queue);
    while (queue->in_flight_count == RADV_PS5_MAX_IN_FLIGHT) {
       const uint64_t oldest = queue->in_flight[queue->in_flight_first].seq;
-      if (!radv_ps5_queue_wait_seq(queue, oldest, OS_TIMEOUT_INFINITE))
+      if (!radv_ps5_queue_wait_seq(queue, oldest, OS_TIMEOUT_INFINITE, "submit (no record free)"))
          return NULL;
       radv_ps5_queue_retire(queue);
    }
    struct radv_ps5_in_flight *const claim =
       &queue->in_flight[(queue->in_flight_first + queue->in_flight_count) % RADV_PS5_MAX_IN_FLIGHT];
-   *claim = (struct radv_ps5_in_flight){.seq = seq, .dedicated = {.physical = -1}};
+   *claim = (struct radv_ps5_in_flight){.seq = seq, .dedicated = {.physical = -1}, .words = count};
 
    if (count > RADV_PS5_RING_WORDS / 2) {
       if (!radv_ps5_memory_alloc((uint64_t)count * 4, RADV_PS5_LARGE_BYTES, true, &claim->dedicated))
@@ -432,7 +432,7 @@ radv_ps5_queue_claim(struct radv_ps5_queue *queue, uint32_t count, uint64_t seq)
          &queue->in_flight[(queue->in_flight_first + i) % RADV_PS5_MAX_IN_FLIGHT];
       if (record->dedicated.cpu || record->end <= start || end <= record->start)
          continue;
-      if (!radv_ps5_queue_wait_seq(queue, record->seq, OS_TIMEOUT_INFINITE))
+      if (!radv_ps5_queue_wait_seq(queue, record->seq, OS_TIMEOUT_INFINITE, "submit (ring space)"))
          return NULL;
    }
    radv_ps5_queue_retire(queue);
@@ -442,7 +442,8 @@ radv_ps5_queue_claim(struct radv_ps5_queue *queue, uint32_t count, uint64_t seq)
     * record; rebuild it in place at the end of the list. */
    struct radv_ps5_in_flight *const slot =
       &queue->in_flight[(queue->in_flight_first + queue->in_flight_count) % RADV_PS5_MAX_IN_FLIGHT];
-   *slot = (struct radv_ps5_in_flight){.seq = seq, .start = start, .end = end, .dedicated = {.physical = -1}};
+   *slot = (struct radv_ps5_in_flight){
+      .seq = seq, .start = start, .end = end, .dedicated = {.physical = -1}, .words = count};
    queue->in_flight_count++;
    queue->ring_head = end;
    return (uint32_t *)queue->ring.cpu + start;
@@ -525,13 +526,14 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
     * it, after the GPU has finished with the one it held. */
    if (ctx->tess_factor_ring_va && (ctx->tess_factor_ring_va != queue->tess_factor_ring_va ||
                                     ctx->tess_factor_ring_size != queue->tess_factor_ring_size)) {
-      radv_ps5_queue_wait_seq(queue, queue->submitted_seq, OS_TIMEOUT_INFINITE);
+      radv_ps5_queue_wait_seq(queue, queue->submitted_seq, OS_TIMEOUT_INFINITE, "submit (tessellation ring)");
       const int set = radv_ps5_set_tess_factor_ring(ctx->tess_factor_ring_va, ctx->tess_factor_ring_size);
       if (set != 0)
          fprintf(stderr, "radv/ps5: sceAgcDriverSetTFRing(0x%llx, %u) failed: 0x%08x\n",
                  (unsigned long long)ctx->tess_factor_ring_va, ctx->tess_factor_ring_size, (unsigned)set);
       queue->tess_factor_ring_va = ctx->tess_factor_ring_va;
       queue->tess_factor_ring_size = ctx->tess_factor_ring_size;
+      queue->tess_factor_ring_seq = queue->submitted_seq + 1;
    }
    /* The off-chip ring RADV allocated holds as many workgroups as its
     * OFFCHIP_BUFFERING names; AGC starts with its own. */
@@ -631,11 +633,20 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
    p_atomic_set(&queue->submitted_seq, seq);
    int submitted = 0;
    const unsigned parts = util_dynarray_num_elements(&starts, uint32_t);
+   /* The claim is the newest record. */
+   struct radv_ps5_in_flight *const record =
+      &queue->in_flight[(queue->in_flight_first + queue->in_flight_count - 1) % RADV_PS5_MAX_IN_FLIGHT];
+   assert(record->seq == seq);
+   record->parts = parts;
+   record->submitted_ns = os_time_get_nano();
+   p_atomic_set(&queue->agc_submit_ns, record->submitted_ns);
+   p_atomic_set(&queue->agc_submit_seq, seq);
    for (unsigned i = 0; i < parts && submitted == 0; i++) {
       const uint32_t start = *util_dynarray_element(&starts, uint32_t, i);
       const uint32_t end = i + 1 < parts ? *util_dynarray_element(&starts, uint32_t, i + 1) : count;
       submitted = radv_ps5_submit(words + start, end - start, queue->marker, (uint32_t)seq);
    }
+   p_atomic_set(&queue->agc_submit_seq, 0);
    util_dynarray_fini(&starts);
    simple_mtx_unlock(&queue->submit_lock);
    if (submitted != 0) {

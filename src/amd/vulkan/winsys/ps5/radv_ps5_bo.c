@@ -269,7 +269,8 @@ radv_ps5_bo_wait_for_idle(struct radeon_winsys *rws, struct radeon_winsys_bo *bo
 {
    (void)bo;
    struct radv_ps5_queue *const queue = radv_ps5_winsys(rws)->queue;
-   return radv_ps5_queue_wait_seq(queue, p_atomic_read(&queue->submitted_seq), OS_TIMEOUT_INFINITE);
+   return radv_ps5_queue_wait_seq(queue, p_atomic_read(&queue->submitted_seq), OS_TIMEOUT_INFINITE,
+                                  "bo_wait_for_idle");
 }
 
 static void
