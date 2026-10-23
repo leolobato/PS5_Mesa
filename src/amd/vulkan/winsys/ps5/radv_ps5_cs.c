@@ -501,6 +501,71 @@ radv_ps5_copy_streams(uint32_t *at, struct ac_cmdbuf **streams, unsigned count)
    return at;
 }
 
+/* RADV_PS5_TRACE: each draw and dispatch is followed by a breadcrumb, a
+ * bottom-of-pipe RELEASE_MEM that writes seq << 16 | n to the queue's trace
+ * word once draw n of the submission and all before it have finished. These
+ * retire in order, so after a stall the word names the last draw that
+ * finished (radv_ps5_queue_report_stall). Debugging only: 8 words a draw. */
+#define RADV_PS5_TRACE_WORDS 8
+
+static void
+radv_ps5_breadcrumb_words(uint32_t *words, uint64_t address, uint32_t value)
+{
+   words[0] = PKT3(PKT3_RELEASE_MEM, 6, 0);
+   words[1] = EVENT_TYPE(V_028A90_BOTTOM_OF_PIPE_TS) | EVENT_INDEX(5);
+   words[2] = EOP_DATA_SEL(EOP_DATA_SEL_VALUE_32BIT);
+   words[3] = (uint32_t)address;
+   words[4] = (uint32_t)(address >> 32);
+   words[5] = value;
+   words[6] = 0;
+   words[7] = 0;
+}
+
+/* A piece's words with breadcrumbs: copied to at (counted only when at is
+ * NULL), a breadcrumb after each draw and dispatch, none inside the words a
+ * COND_EXEC may skip, whose count they would change. A piece whose packets do
+ * not parse to its end is copied as it is. Returns the words written; *crumb
+ * counts the breadcrumbs of the submission. */
+static uint32_t
+radv_ps5_trace_piece(uint32_t *at, const uint32_t *words, uint32_t cdw, uint64_t address, uint64_t seq,
+                     uint32_t *crumb)
+{
+   uint32_t pos = 0;
+   while (pos < cdw) {
+      const uint32_t length = radv_ps5_packet_length(words, pos, cdw);
+      if (!length)
+         break;
+      pos += length;
+   }
+   if (pos != cdw) {
+      if (at)
+         memcpy(at, words, (size_t)cdw * sizeof(uint32_t));
+      return cdw;
+   }
+   uint32_t out = 0, skip = 0;
+   for (pos = 0; pos < cdw;) {
+      const uint32_t length = radv_ps5_packet_length(words, pos, cdw);
+      if (at)
+         memcpy(at + out, words + pos, (size_t)length * sizeof(uint32_t));
+      out += length;
+      const bool skippable = skip > 0;
+      skip = skip > length ? skip - length : 0;
+      if (PKT_TYPE_G(words[pos]) == 3) {
+         const unsigned opcode = PKT3_IT_OPCODE_G(words[pos]);
+         if (opcode == PKT3_COND_EXEC && length >= 5) {
+            skip = words[pos + 4] & 0x3fff;
+         } else if (!skippable && (radv_ps5_packet_is_draw(opcode) || radv_ps5_packet_is_dispatch(opcode))) {
+            ++*crumb;
+            if (at)
+               radv_ps5_breadcrumb_words(at + out, address, (uint32_t)(seq << 16) | (*crumb & 0xffff));
+            out += RADV_PS5_TRACE_WORDS;
+         }
+      }
+      pos += length;
+   }
+   return out;
+}
+
 static VkResult
 radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_submit_info *submit, uint32_t wait_count,
                    const struct vk_sync_wait *waits, uint32_t signal_count, const struct vk_sync_signal *signals)
@@ -559,6 +624,10 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
     * into one AGC submission as long as they fit, and each further AGC
     * submission starts with the preambles again. */
    const uint32_t preamble_words = radv_ps5_count_streams(submit->initial_preamble_cs, submit->initial_preamble_count);
+   const bool trace = radv_ps5_trace_enabled();
+   const uint64_t trace_address = (uint64_t)(uintptr_t)queue->marker_memory.cpu + RADV_PS5_TRACE_OFFSET;
+   const uint64_t seq = queue->submitted_seq + 1;
+   uint32_t crumbs = 0;
    struct util_dynarray pieces, units;
    util_dynarray_init(&pieces, NULL);
    util_dynarray_init(&units, NULL);
@@ -572,7 +641,8 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
          struct radv_ps5_cs_chunk *const piece = util_dynarray_element(&pieces, struct radv_ps5_cs_chunk, p);
          if (p == first || piece->starts_submission)
             util_dynarray_append(&units, ((struct radv_ps5_unit){.first_piece = p}));
-         util_dynarray_last_ptr(&units, struct radv_ps5_unit)->words += piece->cdw;
+         util_dynarray_last_ptr(&units, struct radv_ps5_unit)->words +=
+            trace ? radv_ps5_trace_piece(NULL, piece->words, piece->cdw, trace_address, seq, &crumbs) : piece->cdw;
       }
    }
 
@@ -595,7 +665,6 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
       count += unit->words;
    }
 
-   const uint64_t seq = queue->submitted_seq + 1;
    uint32_t *const words = too_large ? NULL : radv_ps5_queue_claim(queue, count, seq);
    if (!words) {
       simple_mtx_unlock(&queue->submit_lock);
@@ -610,6 +679,7 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
    util_dynarray_init(&starts, NULL);
    util_dynarray_append(&starts, 0u);
    uint32_t *at = radv_ps5_copy_streams(words, submit->initial_preamble_cs, submit->initial_preamble_count);
+   crumbs = 0;
    for (unsigned u = 0; u < unit_count; u++) {
       const struct radv_ps5_unit *const unit = util_dynarray_element(&units, struct radv_ps5_unit, u);
       if (unit->starts_part) {
@@ -620,8 +690,12 @@ radv_ps5_cs_submit(struct radeon_winsys_ctx *rctx, const struct radv_winsys_subm
                                               : util_dynarray_num_elements(&pieces, struct radv_ps5_cs_chunk);
       for (unsigned p = unit->first_piece; p < end; p++) {
          const struct radv_ps5_cs_chunk *const piece = util_dynarray_element(&pieces, struct radv_ps5_cs_chunk, p);
-         memcpy(at, piece->words, (size_t)piece->cdw * sizeof(uint32_t));
-         at += piece->cdw;
+         if (trace) {
+            at += radv_ps5_trace_piece(at, piece->words, piece->cdw, trace_address, seq, &crumbs);
+         } else {
+            memcpy(at, piece->words, (size_t)piece->cdw * sizeof(uint32_t));
+            at += piece->cdw;
+         }
       }
    }
    radv_ps5_completion_words(at, (uint64_t)(uintptr_t)queue->marker, (uint32_t)seq);

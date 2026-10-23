@@ -103,9 +103,18 @@ radv_ps5_wait_function(uint32_t function)
    return names[function & 7];
 }
 
-/* The words of the packet whose header is at words[at], or 0 if there is no
- * packet header there or the packet runs past count. */
-static uint32_t
+bool
+radv_ps5_trace_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *const value = getenv("RADV_PS5_TRACE");
+      enabled = value && *value && strcmp(value, "0") != 0;
+   }
+   return enabled;
+}
+
+uint32_t
 radv_ps5_packet_length(const uint32_t *words, uint32_t at, uint32_t count)
 {
    const uint32_t header = words[at];
@@ -120,7 +129,7 @@ radv_ps5_packet_length(const uint32_t *words, uint32_t at, uint32_t count)
    return length <= count - at ? length : 0;
 }
 
-static bool
+bool
 radv_ps5_packet_is_draw(unsigned opcode)
 {
    switch (opcode) {
@@ -140,7 +149,7 @@ radv_ps5_packet_is_draw(unsigned opcode)
    }
 }
 
-static bool
+bool
 radv_ps5_packet_is_dispatch(unsigned opcode)
 {
    return opcode == PKT3_DISPATCH_DIRECT || opcode == PKT3_DISPATCH_INDIRECT;
@@ -157,6 +166,128 @@ static const struct {
    {R_00B320_SPI_SHADER_PGM_LO_ES, "GS"}, {R_00B520_SPI_SHADER_PGM_LO_LS, "HS"},
    {R_00B830_COMPUTE_PGM_LO, "CS"},
 };
+
+/* The program addresses (>> 8) the packets before word end set, per entry of
+ * radv_ps5_program_regs. */
+static void
+radv_ps5_programs_before(const uint32_t *words, uint32_t count, uint32_t end, uint32_t *program_lo,
+                         uint32_t *program_hi)
+{
+   for (uint32_t at = 0; at < end;) {
+      const uint32_t length = radv_ps5_packet_length(words, at, count);
+      if (!length)
+         break;
+      if (PKT_TYPE_G(words[at]) == 3 && PKT3_IT_OPCODE_G(words[at]) == PKT3_SET_SH_REG && length >= 3) {
+         const uint32_t first = SI_SH_REG_OFFSET + words[at + 1] * 4;
+         for (uint32_t v = 0; v < length - 2; v++) {
+            const uint32_t reg = first + v * 4;
+            for (unsigned r = 0; r < ARRAY_SIZE(radv_ps5_program_regs); r++) {
+               if (reg == radv_ps5_program_regs[r].reg)
+                  program_lo[r] = words[at + 2 + v];
+               else if (reg == radv_ps5_program_regs[r].reg + 4)
+                  program_hi[r] = words[at + 2 + v];
+            }
+         }
+      }
+      at += length;
+   }
+}
+
+/* Words as lines of eight, after a prefix: for decoding offline (ac_parse_ib
+ * for packets, llvm-mc for shader code). */
+static void
+radv_ps5_report_words(const char *prefix, const uint32_t *words, uint32_t first, uint32_t end)
+{
+   for (uint32_t line = first; line < end; line += 8) {
+      char text[8 * 9 + 1];
+      unsigned used = 0;
+      for (uint32_t w = line; w < end && w < line + 8; w++)
+         used += snprintf(text + used, sizeof(text) - used, " %08x", words[w]);
+      fprintf(stderr, "radv/ps5: GPU stall: %s @%u:%s\n", prefix, line, text);
+   }
+}
+
+/* A shader program's code, up to its first s_endpgm: shaders live in the
+ * window, which the CPU sees at the GPU's addresses. */
+#define RADV_PS5_STALL_CODE_WORDS 2048
+#define RADV_PS5_S_ENDPGM 0xbf810000u
+
+static void
+radv_ps5_report_program(const char *stage, uint64_t address)
+{
+   if (address < RADV_PS5_WINDOW_BASE || address >= RADV_PS5_WINDOW_BASE + RADV_PS5_WINDOW_BYTES - 4) {
+      fprintf(stderr, "radv/ps5: GPU stall: %s program 0x%" PRIx64 " is outside the window; not read\n", stage, address);
+      return;
+   }
+   const uint32_t *const code = (const uint32_t *)(uintptr_t)address;
+   const uint64_t room = (RADV_PS5_WINDOW_BASE + RADV_PS5_WINDOW_BYTES - address) / 4;
+   const uint32_t limit = (uint32_t)MIN2(room, RADV_PS5_STALL_CODE_WORDS);
+   uint32_t words = 0;
+   bool ended = false;
+   while (words < limit && !ended)
+      ended = code[words++] == RADV_PS5_S_ENDPGM;
+   fprintf(stderr, "radv/ps5: GPU stall: %s program 0x%" PRIx64 ": %u words%s\n", stage, address, words,
+           ended ? " to s_endpgm" : ", no s_endpgm");
+   char prefix[32];
+   snprintf(prefix, sizeof(prefix), "%s code", stage);
+   radv_ps5_report_words(prefix, code, 0, words);
+}
+
+/* With RADV_PS5_TRACE, the breadcrumb word names the last draw of the stuck
+ * submission that finished: the next one is the draw that did not, and its
+ * packets and shaders are printed. */
+static void
+radv_ps5_report_breadcrumb(uint64_t seq, const uint32_t *words, uint32_t count, uint64_t trace_address)
+{
+   volatile const uint32_t *const trace = (volatile const uint32_t *)(uintptr_t)trace_address;
+   radv_ps5_cpu_flush((const void *)trace, sizeof(*trace));
+   const uint32_t value = *trace;
+   const uint32_t finished = (value >> 16) == (uint32_t)(seq & 0xffff) ? (value & 0xffff) : 0;
+   uint32_t last_work = UINT32_MAX, window = 0, culprit = UINT32_MAX, total = 0;
+   for (uint32_t at = 0; at < count;) {
+      const uint32_t length = radv_ps5_packet_length(words, at, count);
+      if (!length)
+         break;
+      if (PKT_TYPE_G(words[at]) == 3) {
+         const unsigned opcode = PKT3_IT_OPCODE_G(words[at]);
+         if (radv_ps5_packet_is_draw(opcode) || radv_ps5_packet_is_dispatch(opcode)) {
+            last_work = at;
+         } else if (opcode == PKT3_RELEASE_MEM && length >= 6 &&
+                    (words[at + 3] | ((uint64_t)words[at + 4] << 32)) == trace_address) {
+            const uint32_t crumb = words[at + 5] & 0xffff;
+            total = crumb;
+            if (crumb == finished)
+               window = at + length;
+            else if (crumb == finished + 1 && culprit == UINT32_MAX)
+               culprit = last_work;
+         }
+      }
+      at += length;
+   }
+   fprintf(stderr,
+           "radv/ps5: GPU stall: breadcrumb 0x%08x: submission %" PRIu64 " finished %u of its %u draws and dispatches\n",
+           value, seq, finished, total);
+   if (culprit == UINT32_MAX) {
+      fprintf(stderr, "radv/ps5: GPU stall: no draw after breadcrumb %u in submission %" PRIu64 "\n", finished, seq);
+      return;
+   }
+   const uint32_t culprit_end = culprit + radv_ps5_packet_length(words, culprit, count);
+   fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " draw %u at word %u (opcode 0x%02x) did not finish\n", seq,
+           finished + 1, culprit, PKT3_IT_OPCODE_G(words[culprit]));
+   const uint32_t first = culprit_end - window > RADV_PS5_STALL_DUMP_WORDS ? culprit_end - RADV_PS5_STALL_DUMP_WORDS
+                                                                            : window;
+   radv_ps5_report_words("draw window", words, first, culprit_end);
+   uint32_t program_lo[ARRAY_SIZE(radv_ps5_program_regs)] = {0};
+   uint32_t program_hi[ARRAY_SIZE(radv_ps5_program_regs)] = {0};
+   radv_ps5_programs_before(words, count, culprit, program_lo, program_hi);
+   const bool dispatch = radv_ps5_packet_is_dispatch(PKT3_IT_OPCODE_G(words[culprit]));
+   for (unsigned r = 0; r < ARRAY_SIZE(radv_ps5_program_regs); r++) {
+      const bool compute = radv_ps5_program_regs[r].reg == R_00B830_COMPUTE_PGM_LO;
+      if (program_lo[r] && compute == dispatch)
+         radv_ps5_report_program(radv_ps5_program_regs[r].stage,
+                                 ((uint64_t)program_hi[r] << 40) | ((uint64_t)program_lo[r] << 8));
+   }
+}
 
 struct radv_ps5_stall_wait {
    uint32_t at;
@@ -175,7 +306,7 @@ struct radv_ps5_stall_wait {
  * the submission is pending. Its value tells which barrier the GPU passed last:
  * the work after that one is what did not finish, and the report prints it. */
 static void
-radv_ps5_report_packets(uint64_t seq, const uint32_t *words, uint32_t count)
+radv_ps5_report_packets(uint64_t seq, const uint32_t *words, uint32_t count, uint64_t trace_address)
 {
    static struct radv_ps5_stall_wait waits_seen[RADV_PS5_STALL_MAX_WAITS];
    unsigned packets = 0, draws = 0, dispatches = 0, waits = 0, dma = 0, syncs = 0, kept = 0;
@@ -279,25 +410,14 @@ radv_ps5_report_packets(uint64_t seq, const uint32_t *words, uint32_t count)
    /* The shaders bound when that work started, and what the work is. */
    uint32_t program_lo[ARRAY_SIZE(radv_ps5_program_regs)] = {0};
    uint32_t program_hi[ARRAY_SIZE(radv_ps5_program_regs)] = {0};
+   radv_ps5_programs_before(words, count, to, program_lo, program_hi);
    unsigned work_draws = 0, work_dispatches = 0, work_dma = 0;
-   for (at = 0; at < to;) {
+   for (at = from; at < to;) {
       const uint32_t length = radv_ps5_packet_length(words, at, count);
       if (!length)
          break;
       const unsigned opcode = PKT3_IT_OPCODE_G(words[at]);
-      if (PKT_TYPE_G(words[at]) == 3 && opcode == PKT3_SET_SH_REG && length >= 3) {
-         const uint32_t first = SI_SH_REG_OFFSET + words[at + 1] * 4;
-         for (uint32_t v = 0; v < length - 2; v++) {
-            const uint32_t reg = first + v * 4;
-            for (unsigned r = 0; r < ARRAY_SIZE(radv_ps5_program_regs); r++) {
-               if (reg == radv_ps5_program_regs[r].reg)
-                  program_lo[r] = words[at + 2 + v];
-               else if (reg == radv_ps5_program_regs[r].reg + 4)
-                  program_hi[r] = words[at + 2 + v];
-            }
-         }
-      }
-      if (at >= from && PKT_TYPE_G(words[at]) == 3) {
+      if (PKT_TYPE_G(words[at]) == 3) {
          work_draws += radv_ps5_packet_is_draw(opcode);
          work_dispatches += radv_ps5_packet_is_dispatch(opcode);
          work_dma += opcode == PKT3_DMA_DATA;
@@ -316,13 +436,12 @@ radv_ps5_report_packets(uint64_t seq, const uint32_t *words, uint32_t count)
    /* The words themselves, for decoding (ac_parse_ib); the last ones before the
     * barrier if there are more. */
    const uint32_t first = to - from > RADV_PS5_STALL_DUMP_WORDS ? to - RADV_PS5_STALL_DUMP_WORDS : from;
-   for (uint32_t line = first; line < to; line += 8) {
-      char text[8 * 9 + 1];
-      unsigned used = 0;
-      for (uint32_t w = line; w < to && w < line + 8; w++)
-         used += snprintf(text + used, sizeof(text) - used, " %08x", words[w]);
-      fprintf(stderr, "radv/ps5: GPU stall: submission %" PRIu64 " @%u:%s\n", seq, line, text);
-   }
+   char prefix[48];
+   snprintf(prefix, sizeof(prefix), "submission %" PRIu64, seq);
+   radv_ps5_report_words(prefix, words, first, to);
+
+   if (radv_ps5_trace_enabled())
+      radv_ps5_report_breadcrumb(seq, words, count, trace_address);
 }
 
 void
@@ -375,7 +494,8 @@ radv_ps5_queue_report_stall(struct radv_ps5_queue *queue, uint64_t seq, const ch
                  (now - record->submitted_ns) / 1000000);
       /* The oldest one is where the GPU is. */
       if (shown == 0 && record->words)
-         radv_ps5_report_packets(record->seq, words, record->words);
+         radv_ps5_report_packets(record->seq, words, record->words,
+                                 (uint64_t)(uintptr_t)queue->marker_memory.cpu + RADV_PS5_TRACE_OFFSET);
       shown++;
    }
    if (pending > shown)

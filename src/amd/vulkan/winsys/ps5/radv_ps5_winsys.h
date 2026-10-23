@@ -83,6 +83,21 @@ struct radv_ps5_queue {
    cnd_t sync_cond;
 };
 
+/* The breadcrumb word in the marker's page (RADV_PS5_TRACE, radv_ps5_cs.c):
+ * past the marker and the clock's words. */
+#define RADV_PS5_TRACE_OFFSET 3072
+
+/* Whether RADV_PS5_TRACE asks for a breadcrumb after each draw and dispatch,
+ * read once. */
+bool radv_ps5_trace_enabled(void);
+
+/* PM4 walking, for the breadcrumbs and the stall report: the words of the
+ * packet whose header is at words[at] (0 if there is no packet header there or
+ * it runs past count), and the kinds of packet that run shaders. */
+uint32_t radv_ps5_packet_length(const uint32_t *words, uint32_t at, uint32_t count);
+bool radv_ps5_packet_is_draw(unsigned opcode);
+bool radv_ps5_packet_is_dispatch(unsigned opcode);
+
 /* The process's queue, created by the first winsys; NULL if it cannot be. */
 struct radv_ps5_queue *radv_ps5_queue_get(void);
 
