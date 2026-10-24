@@ -272,10 +272,11 @@ radv_ps5_report_buffer(unsigned index, unsigned slot, const uint32_t *descriptor
 {
    const uint64_t base = descriptor[0] | ((uint64_t)(descriptor[1] & 0xffff) << 32);
    const uint32_t records = descriptor[2];
-   /* A buffer descriptor's word 3 names its components (DST_SEL_X..W in the
-    * low 12 bits) and is never 0; an image's or a sampler's look different
-    * but cannot be told apart for sure, so the base must also be sane. */
-   if (!descriptor[3] || !base || base >= RADV_PS5_GPU_ADDRESS_LIMIT || (base & 3) || !records)
+   /* A buffer descriptor's word 3 has TYPE 0 in bits 31:30 (an image's is 8
+    * to 15 in bits 31:28) and names its components, so it is never 0; its
+    * base and size must also be sane before the base is read. */
+   if (!descriptor[3] || (descriptor[3] >> 30) || !base || base >= RADV_PS5_GPU_ADDRESS_LIMIT || (base & 3) || !records ||
+       records > (1u << 28))
       return;
    const uint32_t words = MIN2(records / 4, RADV_PS5_STALL_BUFFER_WORDS);
    fprintf(stderr,
@@ -292,10 +293,14 @@ radv_ps5_report_ps_buffers(const uint32_t *words, uint32_t count, uint32_t end)
    uint32_t user_data[RADV_PS5_PS_USER_DATA] = {0};
    bool set[RADV_PS5_PS_USER_DATA] = {false};
    radv_ps5_ps_user_data_before(words, count, end, user_data, set);
+   /* All of them first: following a pointer reads memory. */
+   for (unsigned i = 0; i < RADV_PS5_PS_USER_DATA; i++) {
+      if (set[i])
+         fprintf(stderr, "radv/ps5: GPU stall: PS user data %u = 0x%08x\n", i, user_data[i]);
+   }
    for (unsigned i = 0; i < RADV_PS5_PS_USER_DATA; i++) {
       if (!set[i])
          continue;
-      fprintf(stderr, "radv/ps5: GPU stall: PS user data %u = 0x%08x\n", i, user_data[i]);
       /* 32-bit pointers carry the window's high word (RADV_PS5_ADDRESS32_HI). */
       if (!user_data[i] || (user_data[i] & 15) || user_data[i] > 0xffffffffu - 64)
          continue;
