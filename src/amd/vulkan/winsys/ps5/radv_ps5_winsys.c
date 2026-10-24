@@ -233,6 +233,81 @@ radv_ps5_report_program(const char *stage, uint64_t address)
    radv_ps5_report_words(prefix, code, 0, words);
 }
 
+/* The pixel shader's user SGPRs as the packets before word end set them. */
+#define RADV_PS5_PS_USER_DATA 16
+
+static void
+radv_ps5_ps_user_data_before(const uint32_t *words, uint32_t count, uint32_t end, uint32_t *user_data, bool *set)
+{
+   for (uint32_t at = 0; at < end;) {
+      const uint32_t length = radv_ps5_packet_length(words, at, count);
+      if (!length)
+         break;
+      if (PKT_TYPE_G(words[at]) == 3 && PKT3_IT_OPCODE_G(words[at]) == PKT3_SET_SH_REG && length >= 3) {
+         const uint32_t first = SI_SH_REG_OFFSET + words[at + 1] * 4;
+         for (uint32_t v = 0; v < length - 2; v++) {
+            const uint32_t reg = first + v * 4;
+            if (reg >= R_00B030_SPI_SHADER_USER_DATA_PS_0 &&
+                reg < R_00B030_SPI_SHADER_USER_DATA_PS_0 + RADV_PS5_PS_USER_DATA * 4) {
+               const unsigned index = (reg - R_00B030_SPI_SHADER_USER_DATA_PS_0) / 4;
+               user_data[index] = words[at + 2 + v];
+               set[index] = true;
+            }
+         }
+      }
+      at += length;
+   }
+}
+
+/* What a stuck draw's pixel shader reads through its user SGPRs: each one that
+ * holds an address in the window (a descriptor set or a push constant block)
+ * is printed with the 16 words there, and every buffer descriptor among them
+ * with the start of its buffer, as the GPU sees them now. Pointers are
+ * followed only into memory a buffer descriptor or the window places in the
+ * GPU's range; this runs last, after everything else is printed. */
+#define RADV_PS5_STALL_BUFFER_WORDS 128
+
+static void
+radv_ps5_report_buffer(unsigned index, unsigned slot, const uint32_t *descriptor)
+{
+   const uint64_t base = descriptor[0] | ((uint64_t)(descriptor[1] & 0xffff) << 32);
+   const uint32_t records = descriptor[2];
+   /* A buffer descriptor's word 3 names its components (DST_SEL_X..W in the
+    * low 12 bits) and is never 0; an image's or a sampler's look different
+    * but cannot be told apart for sure, so the base must also be sane. */
+   if (!descriptor[3] || !base || base >= RADV_PS5_GPU_ADDRESS_LIMIT || (base & 3) || !records)
+      return;
+   const uint32_t words = MIN2(records / 4, RADV_PS5_STALL_BUFFER_WORDS);
+   fprintf(stderr,
+           "radv/ps5: GPU stall: PS user data %u descriptor %u: buffer 0x%" PRIx64 ", %u bytes (%08x %08x %08x %08x)\n",
+           index, slot, base, records, descriptor[0], descriptor[1], descriptor[2], descriptor[3]);
+   char prefix[48];
+   snprintf(prefix, sizeof(prefix), "PS user data %u buffer %u", index, slot);
+   radv_ps5_report_words(prefix, (const uint32_t *)(uintptr_t)base, 0, words);
+}
+
+static void
+radv_ps5_report_ps_buffers(const uint32_t *words, uint32_t count, uint32_t end)
+{
+   uint32_t user_data[RADV_PS5_PS_USER_DATA] = {0};
+   bool set[RADV_PS5_PS_USER_DATA] = {false};
+   radv_ps5_ps_user_data_before(words, count, end, user_data, set);
+   for (unsigned i = 0; i < RADV_PS5_PS_USER_DATA; i++) {
+      if (!set[i])
+         continue;
+      fprintf(stderr, "radv/ps5: GPU stall: PS user data %u = 0x%08x\n", i, user_data[i]);
+      /* 32-bit pointers carry the window's high word (RADV_PS5_ADDRESS32_HI). */
+      if (!user_data[i] || (user_data[i] & 15) || user_data[i] > 0xffffffffu - 64)
+         continue;
+      const uint32_t *const table = (const uint32_t *)(uintptr_t)(RADV_PS5_WINDOW_BASE + user_data[i]);
+      char prefix[32];
+      snprintf(prefix, sizeof(prefix), "PS user data %u table", i);
+      radv_ps5_report_words(prefix, table, 0, 16);
+      for (unsigned slot = 0; slot < 4; slot++)
+         radv_ps5_report_buffer(i, slot, table + slot * 4);
+   }
+}
+
 /* With RADV_PS5_TRACE, the breadcrumb word names the last draw of the stuck
  * submission that finished: the next one is the draw that did not, and its
  * packets and shaders are printed. */
@@ -287,6 +362,8 @@ radv_ps5_report_breadcrumb(uint64_t seq, const uint32_t *words, uint32_t count, 
          radv_ps5_report_program(radv_ps5_program_regs[r].stage,
                                  ((uint64_t)program_hi[r] << 40) | ((uint64_t)program_lo[r] << 8));
    }
+   if (!dispatch)
+      radv_ps5_report_ps_buffers(words, count, culprit);
 }
 
 struct radv_ps5_stall_wait {
