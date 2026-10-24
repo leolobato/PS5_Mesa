@@ -2816,6 +2816,14 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       /* For pixel shaders, wave64 is recommended. */
       if (instance->perftest_flags & RADV_PERFTEST_PS_WAVE_32)
          pdev->ps_wave_size = 32;
+#ifdef RADV_PS5
+      /* The console's GPU stops for good inside wave64 pixel shaders that run
+       * fine in wave32: Stray's first level hung on every load in its pixel
+       * shaders, with every draw's memory mapped, and loads and plays with
+       * them in wave32. RADV_PS5_PS_WAVE64 keeps wave64 for comparisons. */
+      if (!debug_get_bool_option("RADV_PS5_PS_WAVE64", false))
+         pdev->ps_wave_size = 32;
+#endif
 
       if (instance->perftest_flags & RADV_PERFTEST_GE_WAVE_32)
          pdev->ge_wave_size = 32;
