@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "addrlib/inc/addrtypes.h"
 #include "addrlib/src/amdgpu_asic_addr.h"
@@ -233,11 +234,32 @@ radv_ps5_report_program(const char *stage, uint64_t address)
    radv_ps5_report_words(prefix, code, 0, words);
 }
 
-/* The pixel shader's user SGPRs as the packets before word end set them. */
+/* Whether the CPU can read the byte at address: written to a pipe, an address
+ * nothing maps fails with EFAULT where reading it would end the process. Every
+ * buffer of the window and the device-memory region is mapped for the CPU at
+ * the GPU's address, so an unreadable one is memory the GPU cannot reach
+ * either. A pipe that cannot be made says readable. */
+static bool
+radv_ps5_readable(uint64_t address)
+{
+   static int probe[2] = {-1, -1};
+   if (probe[0] < 0 && pipe(probe) != 0) {
+      probe[0] = probe[1] = -1;
+      return true;
+   }
+   if (write(probe[1], (const void *)(uintptr_t)address, 1) != 1)
+      return false;
+   char byte;
+   return read(probe[0], &byte, 1) == 1;
+}
+
+/* A shader stage's user SGPRs as the packets before word end set them. */
 #define RADV_PS5_PS_USER_DATA 16
+#define RADV_PS5_USER_DATA 32
 
 static void
-radv_ps5_ps_user_data_before(const uint32_t *words, uint32_t count, uint32_t end, uint32_t *user_data, bool *set)
+radv_ps5_user_data_before(const uint32_t *words, uint32_t count, uint32_t end, uint32_t base_reg, unsigned regs,
+                          uint32_t *user_data, bool *set)
 {
    for (uint32_t at = 0; at < end;) {
       const uint32_t length = radv_ps5_packet_length(words, at, count);
@@ -247,9 +269,8 @@ radv_ps5_ps_user_data_before(const uint32_t *words, uint32_t count, uint32_t end
          const uint32_t first = SI_SH_REG_OFFSET + words[at + 1] * 4;
          for (uint32_t v = 0; v < length - 2; v++) {
             const uint32_t reg = first + v * 4;
-            if (reg >= R_00B030_SPI_SHADER_USER_DATA_PS_0 &&
-                reg < R_00B030_SPI_SHADER_USER_DATA_PS_0 + RADV_PS5_PS_USER_DATA * 4) {
-               const unsigned index = (reg - R_00B030_SPI_SHADER_USER_DATA_PS_0) / 4;
+            if (reg >= base_reg && reg < base_reg + regs * 4) {
+               const unsigned index = (reg - base_reg) / 4;
                user_data[index] = words[at + 2 + v];
                set[index] = true;
             }
@@ -278,6 +299,11 @@ radv_ps5_report_buffer(unsigned index, unsigned slot, const uint32_t *descriptor
    if (!descriptor[3] || (descriptor[3] >> 30) || !base || base >= RADV_PS5_GPU_ADDRESS_LIMIT || (base & 3) || !records ||
        records > (1u << 28))
       return;
+   if (!radv_ps5_readable(base)) {
+      fprintf(stderr, "radv/ps5: GPU stall: PS user data %u descriptor %u: buffer 0x%" PRIx64 " is NOT MAPPED\n", index,
+              slot, base);
+      return;
+   }
    const uint32_t words = MIN2(records / 4, RADV_PS5_STALL_BUFFER_WORDS);
    fprintf(stderr,
            "radv/ps5: GPU stall: PS user data %u descriptor %u: buffer 0x%" PRIx64 ", %u bytes (%08x %08x %08x %08x)\n",
@@ -292,7 +318,8 @@ radv_ps5_report_ps_buffers(const uint32_t *words, uint32_t count, uint32_t end)
 {
    uint32_t user_data[RADV_PS5_PS_USER_DATA] = {0};
    bool set[RADV_PS5_PS_USER_DATA] = {false};
-   radv_ps5_ps_user_data_before(words, count, end, user_data, set);
+   radv_ps5_user_data_before(words, count, end, R_00B030_SPI_SHADER_USER_DATA_PS_0, RADV_PS5_PS_USER_DATA, user_data,
+                             set);
    /* All of them first: following a pointer reads memory. */
    for (unsigned i = 0; i < RADV_PS5_PS_USER_DATA; i++) {
       if (set[i])
@@ -305,12 +332,69 @@ radv_ps5_report_ps_buffers(const uint32_t *words, uint32_t count, uint32_t end)
       if (!user_data[i] || (user_data[i] & 15) || user_data[i] > 0xffffffffu - 64)
          continue;
       const uint32_t *const table = (const uint32_t *)(uintptr_t)(RADV_PS5_WINDOW_BASE + user_data[i]);
+      if (!radv_ps5_readable((uint64_t)(uintptr_t)table)) {
+         fprintf(stderr, "radv/ps5: GPU stall: PS user data %u table is NOT MAPPED\n", i);
+         continue;
+      }
       char prefix[32];
       snprintf(prefix, sizeof(prefix), "PS user data %u table", i);
       radv_ps5_report_words(prefix, table, 0, 16);
       for (unsigned slot = 0; slot < 4; slot++)
          radv_ps5_report_buffer(i, slot, table + slot * 4);
    }
+}
+
+/* Whether every descriptor a stuck draw can reach points at mapped memory: the
+ * descriptor tables the user SGPRs of its pixel and geometry stages point to
+ * (their first RADV_PS5_STALL_TABLE_WORDS words, which hold every descriptor
+ * set of a DXVK draw), every image and buffer descriptor in them, and the
+ * index buffer. A GPU that waits on a fault forever stalls like a shader that
+ * never ends. Only what is not mapped is printed, then a count. */
+#define RADV_PS5_STALL_TABLE_WORDS 512
+
+static void
+radv_ps5_check_tables(const char *stage, uint32_t base_reg, const uint32_t *words, uint32_t count, uint32_t end)
+{
+   uint32_t user_data[RADV_PS5_USER_DATA] = {0};
+   bool set[RADV_PS5_USER_DATA] = {false};
+   radv_ps5_user_data_before(words, count, end, base_reg, RADV_PS5_USER_DATA, user_data, set);
+   unsigned tables = 0, images = 0, buffers = 0, unmapped = 0;
+   for (unsigned i = 0; i < RADV_PS5_USER_DATA; i++) {
+      if (!set[i] || !user_data[i] || (user_data[i] & 15) || user_data[i] > 0xffffffffu - RADV_PS5_STALL_TABLE_WORDS * 4)
+         continue;
+      const uint64_t table_va = RADV_PS5_WINDOW_BASE + user_data[i];
+      if (!radv_ps5_readable(table_va))
+         continue; /* not a pointer, or a table nothing maps: printed below if so */
+      tables++;
+      const uint32_t *const table = (const uint32_t *)(uintptr_t)table_va;
+      for (uint32_t w = 0; w + 4 <= RADV_PS5_STALL_TABLE_WORDS; w += 4) {
+         if (!radv_ps5_readable(table_va + w * 4))
+            break;
+         const uint32_t *const d = table + w;
+         uint64_t base = 0;
+         const char *kind = NULL;
+         if ((d[3] >> 28) >= 8 && !(w & 7) && w + 8 <= RADV_PS5_STALL_TABLE_WORDS) {
+            base = ((uint64_t)d[0] | ((uint64_t)(d[1] & 0xff) << 32)) << 8;
+            kind = "image";
+            images++;
+            w += 4;
+         } else if (d[3] && !(d[3] >> 30) && d[2] && d[2] <= (1u << 28)) {
+            base = d[0] | ((uint64_t)(d[1] & 0xffff) << 32);
+            if (base < RADV_PS5_WINDOW_BASE || base >= RADV_PS5_GPU_ADDRESS_LIMIT)
+               continue; /* a sampler or data that only looks like a buffer */
+            kind = "buffer";
+            buffers++;
+         }
+         if (kind && base && !radv_ps5_readable(base)) {
+            unmapped++;
+            fprintf(stderr,
+                    "radv/ps5: GPU stall: %s user data %u word %u: %s 0x%" PRIx64 " is NOT MAPPED (%08x %08x %08x %08x)\n",
+                    stage, i, w, kind, base, d[0], d[1], d[2], d[3]);
+         }
+      }
+   }
+   fprintf(stderr, "radv/ps5: GPU stall: %s tables %u: %u images, %u buffers, %u not mapped\n", stage, tables, images,
+           buffers, unmapped);
 }
 
 /* With RADV_PS5_TRACE, the breadcrumb word names the last draw of the stuck
@@ -367,8 +451,16 @@ radv_ps5_report_breadcrumb(uint64_t seq, const uint32_t *words, uint32_t count, 
          radv_ps5_report_program(radv_ps5_program_regs[r].stage,
                                  ((uint64_t)program_hi[r] << 40) | ((uint64_t)program_lo[r] << 8));
    }
-   if (!dispatch)
+   if (!dispatch) {
+      if (PKT3_IT_OPCODE_G(words[culprit]) == PKT3_DRAW_INDEX_2 && culprit_end - culprit >= 5) {
+         const uint64_t index_va = words[culprit + 2] | ((uint64_t)words[culprit + 3] << 32);
+         fprintf(stderr, "radv/ps5: GPU stall: index buffer 0x%" PRIx64 " %s\n", index_va,
+                 radv_ps5_readable(index_va) ? "is mapped" : "is NOT MAPPED");
+      }
+      radv_ps5_check_tables("GS", R_00B230_SPI_SHADER_USER_DATA_GS_0, words, count, culprit);
+      radv_ps5_check_tables("PS", R_00B030_SPI_SHADER_USER_DATA_PS_0, words, count, culprit);
       radv_ps5_report_ps_buffers(words, count, culprit);
+   }
 }
 
 struct radv_ps5_stall_wait {
