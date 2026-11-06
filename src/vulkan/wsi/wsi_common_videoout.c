@@ -10,7 +10,9 @@
  *
  * The display has one plane and one 3840x2160 mode at 59.94 Hz, and a 119.88
  * Hz mode first where the title asks for it and the display refreshes at it
- * (measured, as PS5_Vulkan's ps5vk measured both). The title asks through
+ * (measured, as PS5_Vulkan's ps5vk measured both; with variable refresh on,
+ * an idle display waits for a flip up to its slowest rate, so a vblank comes
+ * later than 60 Hz would bring it). The title asks through
  * PS5_VIDEOOUT_REFRESH (60 or 120, or wsi_videoout_set_refresh before the
  * output opens) or, without it, by declaring high-frame-rate output in its
  * param.json (/app0's, or the one PS5_VIDEOOUT_PARAM_JSON names); VideoOut
@@ -98,6 +100,13 @@
 /* A period above this after the high-frame-rate mode was taken: the display
  * went on refreshing at 60 Hz, as a tester's did (PS5_Vulkan, R31). */
 #define VIDEOOUT_HIGH_REFRESH_LIMIT_NS UINT64_C(12500000)
+/* A period above this is not a display left at 59.94 Hz (16.683 ms) but one
+ * with variable refresh, idle before the first flip, waiting up to its
+ * slowest rate: 20.874 ms, 47.9 Hz, the bottom of the PS5's 48-120 Hz range,
+ * on an LG C1 with the system's VRR on. The 119.88 Hz mode is kept. */
+#define VIDEOOUT_SIXTY_HZ_LIMIT_NS UINT64_C(18000000)
+/* A period above this (24 Hz) is no refresh rate: not measured. */
+#define VIDEOOUT_VARIABLE_REFRESH_LIMIT_NS UINT64_C(42000000)
 /* A period below this (or none, a vblank wait failing) was not measured: no
  * display refreshes faster than 119.88 Hz, every 8.342 ms. */
 #define VIDEOOUT_HIGH_REFRESH_FLOOR_NS UINT64_C(7500000)
@@ -379,6 +388,31 @@ videoout_title_declares_high_frame_rate(void)
    return (value & VIDEOOUT_ATTRIBUTE3_HIGH_FRAME_RATE) == VIDEOOUT_ATTRIBUTE3_HIGH_FRAME_RATE;
 }
 
+#if defined(__PROSPERO__)
+/* Not in ps5platform/videoout.h; libSceVideoOut exports it. The status layout
+ * is not known on the PS5, so a large zeroed buffer takes it. */
+int sceVideoOutGetResolutionStatus(int32_t handle, void *status);
+#endif
+
+/* Logs VideoOut's resolution status once, raw, as words: data for asking
+ * the output's rate instead of timing its vblanks. */
+static void
+videoout_log_resolution_status(int handle, const char *when)
+{
+#if defined(__PROSPERO__)
+   uint32_t words[64];
+   memset(words, 0, sizeof(words));
+   const int result = sceVideoOutGetResolutionStatus(handle, words);
+   fprintf(stderr,
+           "wsi/videoout: resolution status %s: 0x%08x, %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+           when, (unsigned)result, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+           words[8], words[9], words[10], words[11]);
+#else
+   (void)handle;
+   (void)when;
+#endif
+}
+
 /* The refresh period: the median of a few intervals between vblank waits,
  * the first wait finding the phase. 0 when a wait fails. */
 static uint64_t
@@ -474,6 +508,7 @@ videoout_open_locked(void)
    if (refresh == 60) {
       fprintf(stderr, "wsi/videoout: 119.88 Hz not asked for (PS5_VIDEOOUT_REFRESH=60)\n");
    } else if (refresh == 120 || videoout_title_declares_high_frame_rate()) {
+      videoout_log_resolution_status(out->handle, "before 119.88 Hz");
       const int supported =
          sceVideoOutIsOutputSupported(out->handle, PS5_VIDEO_OUT_MODE_HIGH_FRAME_RATE, NULL, NULL, NULL);
       const int configured =
@@ -486,10 +521,14 @@ videoout_open_locked(void)
          /* A period of 0 (a vblank wait failed) or one no display has is no
           * measurement: the mode is not kept unmeasured. */
          const uint64_t period = videoout_vblank_period_ns(out->handle);
-         if (period < VIDEOOUT_HIGH_REFRESH_FLOOR_NS || period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS) {
+         const bool variable = period > VIDEOOUT_SIXTY_HZ_LIMIT_NS && period <= VIDEOOUT_VARIABLE_REFRESH_LIMIT_NS;
+         if (variable) {
+            fprintf(stderr, "wsi/videoout: 119.88 Hz output with variable refresh, an idle vblank every %.3f ms\n",
+                    (double)period / 1e6);
+         } else if (period < VIDEOOUT_HIGH_REFRESH_FLOOR_NS || period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS) {
             sceVideoOutConfigureOutput(out->handle, PS5_VIDEO_OUT_MODE_RESTORE, NULL, NULL, NULL);
             out->high_frame_rate = false;
-            if (period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS)
+            if (period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS && period <= VIDEOOUT_SIXTY_HZ_LIMIT_NS)
                fprintf(stderr,
                        "wsi/videoout: 119.88 Hz accepted, but a vblank comes every %.3f ms; 59.94 Hz restored\n",
                        (double)period / 1e6);
@@ -503,6 +542,7 @@ videoout_open_locked(void)
          fprintf(stderr, "wsi/videoout: 119.88 Hz %s (%d); presenting at 59.94 Hz\n",
                  supported > 0 ? "refused" : "not supported", configured);
       }
+      videoout_log_resolution_status(out->handle, "after 119.88 Hz");
    }
 
    /* The frame rate, now that the output's rate is known: set 0's
