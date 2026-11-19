@@ -51,8 +51,15 @@
  * window that only made a context, as wined3d's hidden 10x10 window probing
  * OpenGL does, must not keep the screen from the window made after it. The
  * one it takes the display from is retired, as an oldSwapchain is. A
- * swapchain that has presented keeps the display until it is destroyed or
- * replaced through oldSwapchain.
+ * swapchain that has presented keeps the display while it presents: until
+ * it is destroyed, replaced through oldSwapchain, or idle for
+ * VIDEOOUT_CPU_IDLE_NS with no flip queued. An idle one gives the display to
+ * the next swapchain made, as one that never presented does: a game that
+ * presents once on a first swapchain and goes on with a second one, as Unity
+ * does when it switches to fullscreen at its first start, must not leave the
+ * screen to a swapchain nothing presents to anymore. It does so only when
+ * two of the new one's buffers are free, since a retired swapchain keeps the
+ * image it holds until it is destroyed.
  */
 
 #include <assert.h>
@@ -359,6 +366,8 @@ struct wsi_videoout_swapchain {
    bool presented;
    /* Presents queued and not yet flipped. */
    uint32_t in_flight;
+   /* When its latest present left the flip queue, 0 before the first. */
+   uint64_t flip_ns;
    struct wsi_image images[];
 };
 
@@ -789,6 +798,7 @@ videoout_flip_thread(void *data)
       out->queue_head = (out->queue_head + 1) % ARRAY_SIZE(out->queue);
       out->queue_count--;
       chain->in_flight--;
+      chain->flip_ns = os_time_get_nano();
       cnd_broadcast(&out->changed);
    }
    return 0;
@@ -1674,13 +1684,37 @@ videoout_swapchain_destroy(struct wsi_swapchain *wsi_chain, const VkAllocationCa
    return VK_SUCCESS;
 }
 
-/* Whether a new swapchain replacing old may take the display: nothing has it,
- * old has it, or what has it never presented. */
+/* Whether a swapchain that presented has stopped: no present waiting for its
+ * flip, and none flipped within VIDEOOUT_CPU_IDLE_NS, the time after which
+ * CPU frames show in its place. */
 static bool
-videoout_display_free_locked(const struct wsi_videoout_swapchain *old)
+videoout_swapchain_idle_locked(const struct wsi_videoout_swapchain *chain)
+{
+   return chain->in_flight == 0 && os_time_get_nano() - chain->flip_ns >= VIDEOOUT_CPU_IDLE_NS;
+}
+
+/* How many of buffers first to first + count - 1 no swapchain holds. */
+static uint32_t
+videoout_unheld_locked(uint32_t first, uint32_t count)
+{
+   uint32_t unheld = 0;
+   for (uint32_t i = first; i < first + count; i++)
+      unheld += !videoout_output.buffer[i].held;
+   return unheld;
+}
+
+/* Whether a new swapchain replacing old, with buffers first to first + count
+ * - 1, may take the display: nothing has it, old has it, or what has it never
+ * presented, or has stopped presenting while the new one has two buffers no
+ * swapchain holds, one to show and one to draw. A retired swapchain holds the
+ * image it acquired until it is destroyed: with too few left, the new one
+ * would wait for a buffer for good. */
+static bool
+videoout_display_free_locked(const struct wsi_videoout_swapchain *old, uint32_t first, uint32_t count)
 {
    const struct wsi_videoout_swapchain *current = videoout_output.current;
-   return !current || current == old || !current->presented;
+   return !current || current == old || !current->presented ||
+          (videoout_swapchain_idle_locked(current) && videoout_unheld_locked(first, count) >= 2);
 }
 
 static VkResult
@@ -1710,17 +1744,17 @@ videoout_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device
    const bool scaled = !wsi_videoout_extent_equal(target, extent);
 
    uint32_t set = 0;
+   const uint32_t num_images = MAX2(pCreateInfo->minImageCount, 3);
    mtx_lock(&out->lock);
    struct wsi_videoout_swapchain *old =
       (struct wsi_videoout_swapchain *)wsi_swapchain_from_handle(pCreateInfo->oldSwapchain);
    VkResult result = videoout_register_locked(target, &set);
-   if (result == VK_SUCCESS && !videoout_display_free_locked(old))
+   if (result == VK_SUCCESS && !videoout_display_free_locked(old, set * VIDEOOUT_BUFFERS, num_images))
       result = VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
    mtx_unlock(&out->lock);
    if (result != VK_SUCCESS)
       return result;
 
-   const uint32_t num_images = MAX2(pCreateInfo->minImageCount, 3);
    const size_t size = sizeof(struct wsi_videoout_swapchain) + num_images * sizeof(struct wsi_image);
    struct wsi_videoout_swapchain *chain = vk_zalloc(pAllocator, size, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (chain == NULL)
@@ -1770,7 +1804,7 @@ videoout_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device
    /* What had the display is retired: its acquires and presents are out of
     * date. It may have presented since the check above. */
    mtx_lock(&out->lock);
-   if (!videoout_display_free_locked(old)) {
+   if (!videoout_display_free_locked(old, chain->first, num_images)) {
       mtx_unlock(&out->lock);
       for (uint32_t i = 0; i < num_images; i++)
          wsi_destroy_image(&chain->base, &chain->images[i]);
@@ -1779,8 +1813,11 @@ videoout_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device
       return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
    }
    if (out->current) {
-      if (out->current != old)
+      if (out->current != old && !out->current->presented)
          fprintf(stderr, "wsi/videoout: a swapchain that never presented gives the display to a new one\n");
+      else if (out->current != old)
+         fprintf(stderr, "wsi/videoout: a swapchain idle for %" PRIu64 " ms gives the display to a new one\n",
+                 (os_time_get_nano() - out->current->flip_ns) / UINT64_C(1000000));
       out->current->retired = true;
    }
    out->current = chain;
