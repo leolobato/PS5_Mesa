@@ -327,6 +327,8 @@ radv_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSi
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    VK_FROM_HANDLE(radv_buffer, dst_buffer, dstBuffer);
 
+   radv_split_cmd_stream_if_due(cmd_buffer);
+
    radv_suspend_conditional_rendering(cmd_buffer);
 
    radv_meta_begin(cmd_buffer);
@@ -346,6 +348,8 @@ radv_CmdFillMemoryKHR(VkCommandBuffer commandBuffer, const VkDeviceAddressRangeK
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    VkAddressCopyFlagsKHR dst_copy_flags = radv_get_copy_flags_from_command_flags(dstFlags);
+
+   radv_split_cmd_stream_if_due(cmd_buffer);
 
    radv_suspend_conditional_rendering(cmd_buffer);
 
@@ -389,6 +393,8 @@ radv_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *pCop
    const VkAddressCopyFlagsKHR src_copy_flags = radv_get_copy_flags_from_bo(src_buffer->bo);
    const VkAddressCopyFlagsKHR dst_copy_flags = radv_get_copy_flags_from_bo(dst_buffer->bo);
 
+   radv_split_cmd_stream_if_due(cmd_buffer);
+
    radv_suspend_conditional_rendering(cmd_buffer);
 
    radv_meta_begin(cmd_buffer);
@@ -413,6 +419,8 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdCopyMemoryKHR(VkCommandBuffer commandBuffer, const VkCopyDeviceMemoryInfoKHR *pCopyMemoryInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   radv_split_cmd_stream_if_due(cmd_buffer);
 
    radv_suspend_conditional_rendering(cmd_buffer);
 
@@ -488,6 +496,8 @@ radv_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDevice
 
    const VkAddressCopyFlagsKHR dst_copy_flags = radv_get_copy_flags_from_bo(dst_buffer->bo);
 
+   radv_split_cmd_stream_if_due(cmd_buffer);
+
    radv_suspend_conditional_rendering(cmd_buffer);
 
    radv_meta_begin(cmd_buffer);
@@ -508,6 +518,8 @@ radv_CmdUpdateMemoryKHR(VkCommandBuffer commandBuffer, const VkDeviceAddressRang
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
    VkAddressCopyFlagsKHR dst_copy_flags = radv_get_copy_flags_from_command_flags(dstFlags);
+
+   radv_split_cmd_stream_if_due(cmd_buffer);
 
    radv_suspend_conditional_rendering(cmd_buffer);
 

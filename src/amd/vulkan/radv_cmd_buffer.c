@@ -13924,12 +13924,14 @@ radv_bind_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
 
 /* A winsys whose submissions each start from reset GPU state and hold a
  * limited number of words (the PlayStation 5's) asks for a long stream to be
- * split. The split falls before a draw or dispatch, and from there the command
- * buffer re-emits its state as if it had just begun, everything it has bound
- * kept: the submission after the split starts with the same preamble. State
- * that re-emission does not restore (streamout, conditional rendering, active
- * queries, an inherited render pass) defers the split until it ends. */
-static void
+ * split. The split falls before a draw, a dispatch or a buffer copy, fill or
+ * update (a run of small copies through CP DMA has no draw or dispatch to
+ * split at), and from there the command buffer re-emits its state as if it
+ * had just begun, everything it has bound kept: the submission after the
+ * split starts with the same preamble. State that re-emission does not
+ * restore (streamout, conditional rendering, active queries, an inherited
+ * render pass) defers the split until it ends. */
+void
 radv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);

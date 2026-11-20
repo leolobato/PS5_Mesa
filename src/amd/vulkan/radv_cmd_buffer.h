@@ -850,6 +850,8 @@ uint32_t radv_init_dcc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *im
 
 void radv_emit_cache_flush(struct radv_cmd_buffer *cmd_buffer);
 
+void radv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer);
+
 void radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_visible, unsigned pred_op,
                                      uint64_t va);
 
