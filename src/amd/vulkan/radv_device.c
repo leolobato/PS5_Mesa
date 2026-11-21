@@ -77,6 +77,19 @@ radv_GetMemoryHostPointerPropertiesEXT(VkDevice _device, VkExternalMemoryHandleT
             break;
          }
       }
+      /* With the heaps unified on an APU (radv_enable_unified_heap_on_apu) there is no GTT memory
+       * type, so the import gets the first CPU-visible type: the memory is the same system memory,
+       * and the import does not depend on the type's domain.
+       */
+      if (!memoryTypeBits) {
+         const uint32_t excluded = RADEON_FLAG_32BIT | RADEON_FLAG_ENCRYPTED | RADEON_FLAG_GL2_BYPASS;
+         for (int i = 0; i < pdev->memory_properties.memoryTypeCount; i++) {
+            if ((pdev->memory_flags[i] & RADEON_FLAG_CPU_ACCESS) && !(pdev->memory_flags[i] & excluded)) {
+               memoryTypeBits = (1 << i);
+               break;
+            }
+         }
+      }
       pMemoryHostPointerProperties->memoryTypeBits = memoryTypeBits;
       return VK_SUCCESS;
    }
