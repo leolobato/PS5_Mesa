@@ -733,6 +733,12 @@ radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs
  * start of GFX1013's range. */
 #define RADV_PS5_GFX1013_REV 0x82
 #define RADV_PS5_GB_ADDR_CONFIG 0x00100044
+/* The PCI device ID the GPU reports (VkPhysicalDeviceProperties::deviceID,
+ * and through DXVK the DeviceId of DXGI's adapter). The console's own is not
+ * known here, so it is the AMD BC-250's, the GC 10.1.3 chip whose traits the
+ * model below takes (amdgpu lists it as Cyan Skillfish). Windows games read an
+ * ID of 0 as no GPU at all. */
+#define RADV_PS5_PCI_DEVICE_ID 0x13fe
 
 /* A GFX10 GPU with the console's units, clocks and memory, as the amdgpu
  * kernel would report it and ac_gpu_info completes it; the IP version and the
@@ -750,7 +756,7 @@ radv_ps5_fill_info(struct radeon_info *info, bool compiler_compat_mode, uint32_t
       .ip_discovery_version = ip_discovery_version,
    };
    struct drm_amdgpu_info_device dev = {
-      .device_id = 0,
+      .device_id = RADV_PS5_PCI_DEVICE_ID,
       .chip_rev = 0,
       .external_rev = external_rev,
       .family = FAMILY_NV,
